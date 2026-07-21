@@ -20,6 +20,7 @@ class ChatwootService:
         name: Optional[str],
         phone: Optional[str],
         email: Optional[str],
+        avatar_url: Optional[str],
         custom_attributes: Dict[str, Any],
         additional_attributes: Optional[Dict[str, Any]] = None,  # NEW
     ) -> Dict[str, Any]:
@@ -74,6 +75,7 @@ class ChatwootService:
                         identifier=vk_identifier,
                         custom_attributes=custom_attributes,
                         additional_attributes=additional_attributes,  # NEW
+                        avatar_url = avatar_url
                     )
                 except Exception as e:
                     logger.warning("[chatwoot] update_contact skipped: %s", e)
@@ -95,6 +97,7 @@ class ChatwootService:
                 identifier=vk_identifier,
                 custom_attributes=custom_attributes or {},
                 additional_attributes=additional_attributes,  # NEW
+                avatar_url = avatar_url
             )
             payload = (created or {}).get("payload") or {}
             contact = payload.get("contact") or created.get("contact") or {}

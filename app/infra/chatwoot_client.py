@@ -64,6 +64,7 @@ class ChatwootClient:
         phone_number: Optional[str] = None,
         email: Optional[str] = None,
         identifier: Optional[str] = None,
+        avatar_url: Optional[str],
         custom_attributes: Optional[Dict[str, Any]] = None,
         additional_attributes: Optional[Dict[str, Any]] = None,  # NEW
     ) -> Dict[str, Any]:
@@ -83,9 +84,11 @@ class ChatwootClient:
             payload["identifier"] = identifier
         if custom_attributes:
             payload["custom_attributes"] = custom_attributes
+        if avatar_url:
+            payload["avatar_url"] = avatar_url
         if additional_attributes:
             payload["additional_attributes"] = additional_attributes
-
+            
         async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
             r = await client.post(url, json=payload)
             r.raise_for_status()
@@ -99,6 +102,7 @@ class ChatwootClient:
         phone_number: Optional[str] = None,
         email: Optional[str] = None,
         identifier: Optional[str] = None,
+        avatar_url: Optional[str],
         custom_attributes: Optional[Dict[str, Any]] = None,
         additional_attributes: Optional[Dict[str, Any]] = None,  # NEW
     ) -> Dict[str, Any]:
@@ -119,6 +123,8 @@ class ChatwootClient:
             payload["custom_attributes"] = custom_attributes
         if additional_attributes is not None:
             payload["additional_attributes"] = additional_attributes
+        if avatar_url is not None:
+            payload["avatar_url"] = avatar_url
 
         async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
             r = await client.patch(url, json=payload)

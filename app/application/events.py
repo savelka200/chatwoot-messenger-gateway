@@ -20,10 +20,10 @@ async def _fetch_vk_profile(
     - first_name, last_name (for contact.name)
     - bdate (for custom attribute vk_bdate)
     """
-    url = "https://api.vk.com/method/users.get"
+    url = "https://api.vk.ru/method/users.get"
     params = {
         "user_ids": user_id,
-        "fields": "bdate,city,screen_name",
+        "fields": "bdate,city,screen_name,photo_200",
         "access_token": access_token,
         "v": api_version,
     }
@@ -134,6 +134,7 @@ def wire_events(
                 last = (profile.get("last_name") or "").strip()
                 screen_name = (profile.get("screen_name") or "").strip()
                 vk_bdate = (profile.get("bdate") or "").strip() or None
+                photo = (profile.get("photo_200") or "")
 
                 # Extract city from profile; VK may return dict with "title" or a plain string
                 city_info = profile.get("city")
@@ -167,6 +168,7 @@ def wire_events(
                 email=None,
                 custom_attributes=custom_attributes,
                 additional_attributes=additional_attributes,  # pass city here
+                avatar_url=photo
             )
 
             conv_id = await cw.ensure_conversation(

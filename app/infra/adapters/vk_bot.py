@@ -34,7 +34,7 @@ class VkAdapter(MessengerAdapter):
         # Initialize HTTP client once
         if self._http is None:
             self._http = httpx.AsyncClient(
-                base_url="https://api.vk.com/method",
+                base_url="https://api.vk.ru/method",
                 timeout=15,
                 headers={"User-Agent": "chatwoot-integration/1.0"},
             )
