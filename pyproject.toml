@@ -1,32 +1,29 @@
-[project]
+[tool.poetry]
 name = "chatwoot-integrations"
 version = "0.1.0"
-description = ""
+description = "Chatwoot Messenger Gateway"
 authors = [
-    {name = "@feel90d",email = "feel90d@gmail.com"},
-    {name = "@lukyan0v_a",email = "forjob34@gmail.com"},
+    "feel90d <feel90d@gmail.com>",
+    "lukyan0v_a <forjob34@gmail.com>"
 ]
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-    "fastapi[standard-no-fastapi-cloud-cli] (>=0.116.1,<0.117.0)",
-    "httpx (>=0.28.1,<0.29.0)",
-    "pyee (>=13.0.0,<14.0.0)",
-    "python-dotenv (>=1.1.1,<2.0.0)",
-    "telethon (>=1.40.0,<2.0.0)",
-    "cryptg (>=0.5.1,<0.6.0)",
-    "pillow (>=11.3.0,<12.0.0)"
-]
-
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.poetry]
 packages = [
     { include = "app" }
 ]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+fastapi = {version = ">=0.116.1,<0.117.0", extras = ["standard-no-fastapi-cloud-cli"]}
+httpx = ">=0.28.1,<0.29.0"
+pyee = ">=13.0.0,<14.0.0"
+python-dotenv = ">=1.1.1,<2.0.0"
+telethon = ">=1.40.0,<2.0.0"
+cryptg = ">=0.5.1,<0.6.0"
+pillow = ">=11.3.0,<12.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^6.0.1"
@@ -36,4 +33,3 @@ flake8 = "^7.3.0"
 [tool.poetry.scripts]
 lint = "scripts.lint:main"
 gen-webhook-id = "scripts.gen_webhook_id:main"
-
