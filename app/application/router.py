@@ -1,7 +1,7 @@
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from app.domain.message import TextContent
+from app.domain.message import MediaContent, TextContent
 from app.domain.ports import MessengerAdapter
 from app.domain.webhooks.chatwoot import ChatwootMessageCreatedWebhook
 
@@ -112,7 +112,7 @@ class MessageRouter:
 
     async def handle_outgoing(self, payload: dict) -> None:
         """
-        Process Chatwoot outgoing webhook and dispatch text to a proper adapter.
+        Process Chatwoot outgoing webhook and dispatch text/media to a proper adapter.
         Note: we trust channel injected at HTTP layer: payload['conversation']['meta']['channel'].
         """
         try:
@@ -138,18 +138,30 @@ class MessageRouter:
         # Always derive recipient_id (Chatwoot never provides it)
         recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
 
-        if not channel or not recipient_id or not text:
+        if not channel or not recipient_id:
             logger.warning(
-                "[router] Missing fields: channel=%r recipient_id=%r text=%r",
+                "[router] Missing fields: channel=%r recipient_id=%r",
                 channel,
                 recipient_id,
-                text,
             )
             return
 
-        await self.dispatch_outbound(
-            channel=channel, recipient_id=recipient_id, text=text
-        )
+        # Check for attachments first
+        attachments = cw.attachments or []
+        if attachments:
+            # Send media attachments
+            for att in attachments:
+                await self.dispatch_media(
+                    channel=channel,
+                    recipient_id=recipient_id,
+                    attachment=att,
+                    caption=text if text else None,
+                )
+        elif text:
+            # Send text only if no attachments
+            await self.dispatch_outbound(
+                channel=channel, recipient_id=recipient_id, text=text
+            )
 
     async def dispatch_outbound(
         self, channel: str, recipient_id: str, text: str
@@ -166,4 +178,53 @@ class MessageRouter:
             channel,
             recipient_id,
             text,
+        )
+
+    async def dispatch_media(
+        self, channel: str, recipient_id: str, attachment: Any, caption: Optional[str] = None
+    ) -> None:
+        """Send media attachment via selected channel adapter."""
+        adapter = self.adapters.get(channel)
+        if not adapter:
+            logger.warning("[router] No adapter for channel=%s", channel)
+            return
+
+        # Map content_type to media_type
+        content_type = attachment.content_type or ""
+        filename = attachment.filename or ""
+        
+        media_type_map = {
+            "image/": "image",
+            "video/": "video",
+            "audio/": "audio",
+        }
+        
+        media_type = "document"  # default
+        for prefix, mtype in media_type_map.items():
+            if content_type.startswith(prefix):
+                media_type = mtype
+                break
+        
+        # Use data_url or file_url for download
+        url = attachment.data_url or attachment.file_url
+        if not url:
+            logger.warning("[router] No URL in attachment: %s", attachment)
+            return
+
+        media_content = MediaContent(
+            type="media",
+            media_type=media_type,  # type: ignore
+            url=url,
+            caption=caption,
+            filename=filename if filename else None,
+            mime_type=content_type if content_type else None,
+        )
+
+        await adapter.send_media(recipient_id, media_content)
+        logger.info(
+            "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s type=%s url=%s",
+            channel,
+            recipient_id,
+            media_type,
+            url,
         )
