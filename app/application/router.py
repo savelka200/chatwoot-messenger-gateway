@@ -1,6 +1,7 @@
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from app.application.chatwoot_service import ChatwootService
 from app.domain.message import (
     ContactContent,
     LocationContent,
@@ -27,8 +28,9 @@ def _dig(src: dict, *path, default=None):
 class MessageRouter:
     """Router: dispatch outgoing messages to channel adapters."""
 
-    def __init__(self, adapters: Dict[str, MessengerAdapter] | None = None):
+    def __init__(self, adapters: Dict[str, MessengerAdapter] | None = None, cw_service: Optional[ChatwootService] = None):
         self.adapters = adapters or {}
+        self._cw_service = cw_service
 
     async def handle_incoming(self, msg):
         # Not implemented in this demo
@@ -146,6 +148,20 @@ class MessageRouter:
         # Check for attachments first (media, sticker, etc.)
         attachments = _dig(payload, "message", "attachments", default=[])
         if attachments and len(attachments) > 0:
+            if not channel:
+                logger.warning(
+                    "[router] Missing channel for attachment",
+                )
+                return
+            # Derive recipient_id if not already derived
+            if not recipient_id:
+                recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
+            if not recipient_id:
+                logger.warning(
+                    "[router] Missing recipient_id for attachment: channel=%r",
+                    channel,
+                )
+                return
             await self.dispatch_outbound_with_attachments(
                 channel=channel,
                 recipient_id=recipient_id,
