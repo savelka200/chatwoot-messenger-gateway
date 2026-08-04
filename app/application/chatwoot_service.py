@@ -182,3 +182,16 @@ class ChatwootService:
         msg_id = (res or {}).get("id") or ((res or {}).get("payload") or {}).get("id")
         logger.info("[chatwoot] create_message id=%s type=%s", msg_id, message_type)
         return int(msg_id)
+
+    async def get_message(
+        self,
+        *,
+        conversation_id: int,
+        message_id: int,
+    ) -> Dict[str, Any]:
+        """Get a specific message from Chatwoot (to fetch attachments)."""
+        res = await self._client.get_message(
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+        return res or {}

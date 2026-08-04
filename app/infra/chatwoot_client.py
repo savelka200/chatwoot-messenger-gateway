@@ -178,3 +178,15 @@ class ChatwootClient:
             r = await client.post(url, json=payload)
             r.raise_for_status()
             return r.json()
+
+    async def get_message(
+        self,
+        conversation_id: int,
+        message_id: int,
+    ) -> Dict[str, Any]:
+        """Get a specific message from a conversation (to fetch attachments)."""
+        url = f"{self._account_base}/conversations/{conversation_id}/messages/{message_id}"
+        async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.json()
