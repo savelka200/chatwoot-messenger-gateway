@@ -1,7 +1,13 @@
 import logging
 from typing import Any, Dict
 
-from app.domain.message import TextContent
+from app.domain.message import (
+    ContactContent,
+    LocationContent,
+    MediaContent,
+    StickerContent,
+    TextContent,
+)
 from app.domain.ports import MessengerAdapter
 from app.domain.webhooks.chatwoot import ChatwootMessageCreatedWebhook
 
@@ -19,7 +25,7 @@ def _dig(src: dict, *path, default=None):
 
 
 class MessageRouter:
-    """Router: dispatch outgoing text messages to channel adapters."""
+    """Router: dispatch outgoing messages to channel adapters."""
 
     def __init__(self, adapters: Dict[str, MessengerAdapter] | None = None):
         self.adapters = adapters or {}
@@ -112,7 +118,7 @@ class MessageRouter:
 
     async def handle_outgoing(self, payload: dict) -> None:
         """
-        Process Chatwoot outgoing webhook and dispatch text to a proper adapter.
+        Process Chatwoot outgoing webhook and dispatch to a proper adapter.
         Note: we trust channel injected at HTTP layer: payload['conversation']['meta']['channel'].
         """
         try:
@@ -133,11 +139,22 @@ class MessageRouter:
 
         # Channel comes from raw payload (HTTP layer injected it into meta)
         channel = _dig(payload, "conversation", "meta", "channel")
-        text = (cw.content or "").strip()
 
         # Always derive recipient_id (Chatwoot never provides it)
         recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
 
+        # Check for attachments first (media, sticker, etc.)
+        attachments = _dig(payload, "message", "attachments", default=[])
+        if attachments and len(attachments) > 0:
+            await self.dispatch_outbound_with_attachments(
+                channel=channel,
+                recipient_id=recipient_id,
+                attachments=attachments,
+                text=cw.content or "",
+            )
+            return
+
+        text = (cw.content or "").strip()
         if not channel or not recipient_id or not text:
             logger.warning(
                 "[router] Missing fields: channel=%r recipient_id=%r text=%r",
@@ -167,3 +184,109 @@ class MessageRouter:
             recipient_id,
             text,
         )
+
+    async def dispatch_outbound_with_attachments(
+        self,
+        channel: str,
+        recipient_id: str | None,
+        attachments: list,
+        text: str,
+    ) -> None:
+        """Send media/sticker/location/contact via selected channel adapter."""
+        if not recipient_id:
+            logger.warning(
+                "[router] Cannot send attachment without recipient_id: channel=%s",
+                channel,
+            )
+            return
+
+        adapter = self.adapters.get(channel)
+        if not adapter:
+            logger.warning("[router] No adapter for channel=%s", channel)
+            return
+
+        # Process each attachment
+        for att in attachments:
+            att_type = att.get("type")
+            data_url = att.get("data_url") or att.get("url")
+
+            try:
+                if att_type in ("image", "video", "audio", "file"):
+                    # Map to MediaContent
+                    media_type_map = {
+                        "image": "image",
+                        "video": "video",
+                        "audio": "audio",
+                        "file": "document",
+                    }
+                    media_type = media_type_map.get(att_type, "document")
+                    content = MediaContent(
+                        type="media",
+                        media_type=media_type,  # type: ignore
+                        url=data_url,
+                        caption=text,
+                        filename=att.get("filename"),
+                        mime_type=att.get("mime_type"),
+                    )
+                    await adapter.send_media(recipient_id, content)
+                    logger.info(
+                        "[router] OUTBOUND media: channel=%s type=%s",
+                        channel,
+                        media_type,
+                    )
+
+                elif att_type == "sticker":
+                    # Sticker with image URL
+                    content = StickerContent(type="sticker", ref=data_url or "")
+                    await adapter.send_sticker(recipient_id, content)
+                    logger.info("[router] OUTBOUND sticker: channel=%s", channel)
+
+                elif att_type == "location":
+                    # Location with lat/long
+                    lat = att.get("latitude", 0.0)
+                    lon = att.get("longitude", 0.0)
+                    name = att.get("name") or text
+                    content = LocationContent(
+                        type="location",
+                        latitude=lat,
+                        longitude=lon,
+                        name=name,
+                    )
+                    await adapter.send_location(recipient_id, content)
+                    logger.info(
+                        "[router] OUTBOUND location: channel=%s lat=%s long=%s",
+                        channel,
+                        lat,
+                        lon,
+                    )
+
+                elif att_type == "contact":
+                    # Contact card
+                    name = att.get("name", "Unknown")
+                    phone = att.get("phone_number", "")
+                    org = att.get("org")
+                    content = ContactContent(
+                        type="contact",
+                        name=name,
+                        phone=phone,
+                        org=org,
+                    )
+                    await adapter.send_contact(recipient_id, content)
+                    logger.info(
+                        "[router] OUTBOUND contact: channel=%s name=%s",
+                        channel,
+                        name,
+                    )
+
+                else:
+                    logger.warning(
+                        "[router] Unknown attachment type: %s, sending as text",
+                        att_type,
+                    )
+                    if text:
+                        await self.dispatch_outbound(channel, recipient_id, text)
+
+            except Exception as e:
+                logger.exception(
+                    "[router] Failed to send attachment %s: %s", att_type, e
+                )
