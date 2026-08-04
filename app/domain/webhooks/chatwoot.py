@@ -1,6 +1,16 @@
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
+
+
+class ChatwootAttachment(BaseModel):
+    """Chatwoot message attachment."""
+    id: Optional[int] = None
+    data_url: Optional[str] = None  # Full URL to download
+    file_url: Optional[str] = None   # Public URL
+    thumb_url: Optional[str] = None
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
 
 
 class ChatwootConversationMeta(BaseModel):
@@ -20,3 +30,4 @@ class ChatwootMessageCreatedWebhook(BaseModel):
     private: Optional[bool] = None
     content: Optional[str] = None
     conversation: ChatwootConversation = ChatwootConversation()
+    attachments: Optional[List[ChatwootAttachment]] = None
