@@ -511,7 +511,7 @@ class VKMediaService:
         caption: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Загружает видео и возвращает строку вложения.
+        Загружает видео через video.save и возвращает строку вложения.
         
         Args:
             file_bytes: Видео файл content
@@ -525,53 +525,70 @@ class VKMediaService:
         try:
             logger.info("[vk-media] Starting video upload for peer_id=%d, filename=%s", peer_id, filename)
             
-            # Step 1: Создаём объект видео и получаем ссылку для загрузки
-            create_params = {"peer_id": peer_id}
-            if caption:
-                create_params["name"] = caption[:100]  # Ограничение VK на имя
+            # Step 1: Вызываем video.save для получения upload_url
+            # Для отправки в личные сообщения используем is_private=1
+            save_params: Dict[str, Any] = {
+                "is_private": 1,  # Видео доступно только по ссылке/в сообщении
+                "wallpost": 0,    # Не публиковать на стене
+                "no_comments": 1, # Отключить комментарии
+                "repeat": 1       # Зациклить воспроизведение
+            }
             
-            create_resp = await self._vk_call("video.create", create_params)
-            if not create_resp:
-                logger.error("[vk-media] Failed to create video object: %s", create_resp)
+            if caption:
+                save_params["name"] = caption[:128]
+            elif filename:
+                save_params["name"] = filename[:128]
+            
+            # Если peer_id отрицательный (сообщество), передаем group_id
+            if peer_id < 0:
+                save_params["group_id"] = abs(peer_id)
+            
+            logger.info("[vk-media] Calling video.save with params: %s", save_params)
+            create_resp = await self._vk_call("video.save", save_params)
+            
+            if not create_resp or "upload_url" not in create_resp:
+                logger.error("[vk-media] video.save did not return upload_url. Response: %s", create_resp)
                 return None
             
             upload_url = create_resp.get("upload_url")
             video_id = create_resp.get("video_id")
             owner_id = create_resp.get("owner_id")
+            access_key = create_resp.get("access_key")
             
-            if not upload_url or not video_id or owner_id is None:
-                logger.error("[vk-media] Invalid create response: %s", create_resp)
+            if not upload_url:
+                logger.error("[vk-media] Invalid video.save response: no upload_url")
                 return None
             
-            logger.info("[vk-media] Got video upload URL, video_id=%d, owner_id=%d", video_id, owner_id)
+            logger.info("[vk-media] Got video upload URL, video_id=%s, owner_id=%s", video_id, owner_id)
             
             # Step 2: Загружаем файл на полученный URL
-            mime_type = "video/mp4"  # VK принимает mp4
+            mime_type = "video/mp4"
             upload_result = await self._upload_video_to_url(upload_url, file_bytes, filename, mime_type)
             
             if not upload_result:
                 logger.error("[vk-media] Video upload failed")
                 return None
             
-            # Step 3: Сохраняем видео (если требуется)
-            video_file = upload_result.get("video_file")
-            if video_file:
-                save_params = {
-                    "video_file": video_file,
-                    "video_id": video_id,
-                    "owner_id": owner_id,
-                }
-                if caption:
-                    save_params["name"] = caption[:100]
-                
-                save_resp = await self._vk_call("video.save", save_params)
-                if not save_resp:
-                    logger.warning("[vk-media] video.save returned empty, but video might be ready")
-                else:
-                    logger.info("[vk-media] Video saved successfully: %s", save_resp)
+            # После загрузки video.save уже вернул нам video_id и owner_id
+            # Дополнительные вызовы не нужны, VK автоматически сохраняет видео после загрузки
+            
+            # Проверяем, не обновил ли сервер данные после загрузки
+            if "video_id" in upload_result and upload_result["video_id"]:
+                video_id = upload_result["video_id"]
+            if "owner_id" in upload_result and upload_result["owner_id"]:
+                owner_id = upload_result["owner_id"]
+            if "access_key" in upload_result and upload_result["access_key"]:
+                access_key = upload_result["access_key"]
+            
+            if not video_id or owner_id is None:
+                logger.error("[vk-media] Missing video_id or owner_id after upload")
+                return None
             
             # Формируем строку вложения
             attachment_string = f"video{owner_id}_{video_id}"
+            if access_key:
+                attachment_string += f"_{access_key}"
+            
             logger.info("[vk-media] Built video attachment string: %s", attachment_string)
             return attachment_string
             
