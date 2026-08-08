@@ -361,9 +361,25 @@ class VKMediaService:
             logger.info("[vk-media] Save result: %s", saved)
             
             if saved:
-                doc_data = saved
-                owner_id = doc_data.get("owner_id", -self._group_id)
+                # Handle both 'doc' and 'audio_message' response formats
+                if 'doc' in saved:
+                    doc_data = saved['doc']
+                elif 'audio_message' in saved:
+                    doc_data = saved['audio_message']
+                else:
+                    doc_data = saved
+                
+                # Get owner_id and doc_id from the response
+                # owner_id can be negative for group docs, positive for user docs
+                owner_id = doc_data.get("owner_id", 0)
                 doc_id = doc_data.get("id", 0)
+                
+                logger.info("[vk-media] Extracted owner_id=%d, doc_id=%d from save response", owner_id, doc_id)
+                
+                if doc_id == 0:
+                    logger.error("[vk-media] Document ID is 0, something went wrong in docs.save")
+                    return None
+                
                 result = self.build_attachment_string("doc", owner_id, doc_id)
                 logger.info("[vk-media] Built attachment string: %s", result)
                 return result
