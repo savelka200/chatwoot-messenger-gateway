@@ -1,6 +1,9 @@
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class ChatwootClient:
@@ -212,8 +215,10 @@ class ChatwootClient:
         if message_type:
             form_data.add_field("message_type", message_type)
         
-        # Add attachments[] field for each file
+        # Add attachments[] field for each file - Chatwoot expects this exact field name
         for idx, (filename, file_bytes, mime_type) in enumerate(files):
+            logger.info("[chatwoot-client] Adding attachment %d: %s (%d bytes, %s)", 
+                       idx, filename, len(file_bytes), mime_type)
             form_data.add_field(
                 "attachments[]",
                 file_bytes,
@@ -227,7 +232,9 @@ class ChatwootClient:
             "Authorization": self._headers["Authorization"],
         }
         
+        logger.info("[chatwoot-client] Sending multipart message to %s with %d files", url, len(files))
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(url, headers=headers, content=form_data)
+            logger.info("[chatwoot-client] Response status: %d, body: %s", r.status_code, r.text[:500])
             r.raise_for_status()
             return r.json()

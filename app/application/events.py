@@ -58,6 +58,8 @@ async def _process_vk_attachments_and_send_to_chatwoot(
     Files are sent as multipart attachments to Chatwoot.
     """
     try:
+        logger.info("[events-vk] Starting attachment processing: %d files", len(files_bytes))
+        
         # Ensure contact first
         ensured = await cw.ensure_contact(
             inbox_id=inbox_id,
@@ -69,12 +71,14 @@ async def _process_vk_attachments_and_send_to_chatwoot(
             additional_attributes=additional_attributes,
             avatar_url=avatar_url,
         )
+        logger.info("[events-vk] Contact ensured: id=%s", ensured.get("id"))
 
         conv_id = await cw.ensure_conversation(
             inbox_id=inbox_id,
             contact_id=ensured["id"],
             source_id=ensured["source_id"],
         )
+        logger.info("[events-vk] Conversation ensured: id=%s", conv_id)
 
         # Build files list for Chatwoot: (filename, file_bytes, mime_type)
         files = []
@@ -98,10 +102,12 @@ async def _process_vk_attachments_and_send_to_chatwoot(
             elif filename.endswith(".doc") or filename.endswith(".docx"):
                 mime_type = "application/msword"
             
+            logger.info("[events-vk] File %d: %s (%d bytes, %s)", i, filename, len(file_bytes), mime_type)
             files.append((filename, file_bytes, mime_type))
 
         # Send message with attachments to Chatwoot
         if files:
+            logger.info("[events-vk] Sending %d attachments to Chatwoot conv_id=%s", len(files), conv_id)
             await cw._client.send_message_with_attachments(
                 conversation_id=conv_id,
                 content=text if text else None,
@@ -114,6 +120,7 @@ async def _process_vk_attachments_and_send_to_chatwoot(
             )
         else:
             # Fallback to text-only if no files processed
+            logger.warning("[events-vk] No files to send, falling back to text-only")
             await cw.create_message(
                 conversation_id=conv_id,
                 content=text,
@@ -254,6 +261,7 @@ def wire_events(
 
             if files_bytes and filenames:
                 # Handle message with attachments
+                logger.info("[events] Processing VK message with %d attachments", len(files_bytes))
                 await _process_vk_attachments_and_send_to_chatwoot(
                     cw=cw,
                     inbox_id=inbox_id,
@@ -269,6 +277,7 @@ def wire_events(
                 )
             else:
                 # Handle text-only message
+                logger.info("[events] Processing VK text-only message: %s", text[:50] if text else "(empty)")
                 ensured = await cw.ensure_contact(
                     inbox_id=inbox_id,
                     search_key=from_id,

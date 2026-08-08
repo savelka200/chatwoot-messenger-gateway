@@ -61,7 +61,10 @@ class VKMediaService:
     async def download_file(self, url: str, timeout: float = 60.0) -> bytes:
         """Download file from URL to memory."""
         client = await self._get_client()
-        resp = await client.get(url, timeout=timeout)
+        # Follow redirects for Chatwoot URLs which return 302
+        resp = await client.get(url, timeout=timeout, follow_redirects=True)
+        logger.info("[vk-media] Downloaded file from %s: status=%d size=%d", 
+                    url[:80], resp.status_code, len(resp.content))
         resp.raise_for_status()
         return resp.content
 

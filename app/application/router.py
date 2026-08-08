@@ -239,6 +239,10 @@ class MessageRouter:
                     mime_type=content_type or None,
                 )
                 
+                logger.info("[router] Created MediaContent: media_type=%s url=%s caption=%s filename=%s",
+                           media_type, file_url[:80] if file_url else None, 
+                           text[:50] if text else None, filename)
+                
                 await adapter.send_media(recipient_id, content)
                 logger.info(
                     "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s url=%s",
