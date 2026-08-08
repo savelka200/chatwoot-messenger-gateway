@@ -1,5 +1,6 @@
 """VK Media Service - handles media upload/download operations with VK API."""
 
+import asyncio
 import io
 import json
 import logging
@@ -74,24 +75,71 @@ class VKMediaService:
         result = await self._vk_call("photos.getMessagesUploadServer", {})
         return result["upload_url"]
 
-    async def upload_photo(self, upload_url: str, file_bytes: bytes, filename: str = "photo.jpg") -> Dict[str, Any]:
-        """Upload photo to VK server."""
-        client = await self._get_client()
-        # Use multipart form data for upload - VK expects the field name to be exactly "photo"
-        files = {"photo": (filename, file_bytes, "image/jpeg")}
-        logger.info("[vk-media] Uploading to URL: %s...", upload_url[:50])
-        logger.info("[vk-media] File size: %d bytes, filename: %s", len(file_bytes), filename)
-        resp = await client.post(upload_url, files=files)
-        logger.info("[vk-media] Upload response status: %d", resp.status_code)
-        logger.info("[vk-media] Upload response text (first 500 chars): %s", resp.text[:500])
-        resp.raise_for_status()
-        try:
-            result = resp.json()
-            logger.info("[vk-media] Raw upload response JSON: %s", result)
-            return result
-        except json.JSONDecodeError as e:
-            logger.error("[vk-media] Failed to parse JSON response: %s. Response text: %s", e, resp.text[:500])
-            raise
+    async def upload_photo(self, upload_url: str, file_bytes: bytes, filename: str = "photo.jpg", max_retries: int = 3) -> Dict[str, Any]:
+        """Upload photo to VK server with retry logic."""
+        last_error = None
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.warning("[vk-media] Retry attempt %d/%d for photo upload", attempt + 1, max_retries)
+                await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+            
+            try:
+                # Use multipart form data for upload - VK expects the field name to be exactly "photo"
+                files = {"photo": (filename, io.BytesIO(file_bytes), "image/jpeg")}
+                logger.info("[vk-media] Uploading to URL: %s... (attempt %d)", upload_url[:50], attempt + 1)
+                logger.info("[vk-media] File size: %d bytes, filename: %s", len(file_bytes), filename)
+                
+                # Используем отдельный клиент для загрузки файлов
+                upload_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+                try:
+                    resp = await upload_client.post(upload_url, files=files)
+                finally:
+                    await upload_client.aclose()
+                    
+                logger.info("[vk-media] Upload response status: %d", resp.status_code)
+                logger.info("[vk-media] Upload response text (first 500 chars): %s", resp.text[:500])
+                
+                if resp.status_code == 405:
+                    logger.warning("[vk-media] Got 405 error, will retry...")
+                    last_error = httpx.HTTPStatusError(f"405 Method Not Allowed", request=resp.request, response=resp)
+                    continue
+                
+                resp.raise_for_status()
+                try:
+                    result = resp.json()
+                    logger.info("[vk-media] Raw upload response JSON: %s", result)
+                    
+                    # Проверяем, есть ли ошибка в ответе
+                    if isinstance(result, dict) and "error" in result:
+                        logger.error("[vk-media] Photo upload returned error: %s - %s", 
+                                    result.get("error"), result.get("error_descr"))
+                        if attempt < max_retries - 1:
+                            continue  # Пробуем ещё раз
+                        raise RuntimeError(f"VK photo upload error: {result.get('error')} - {result.get('error_descr')}")
+                    
+                    return result
+                except json.JSONDecodeError as e:
+                    logger.error("[vk-media] Failed to parse JSON response: %s. Response text: %s", e, resp.text[:500])
+                    raise
+                    
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.error("[vk-media] HTTP error on attempt %d: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    continue
+                raise
+            except Exception as e:
+                last_error = e
+                logger.error("[vk-media] Unexpected error on attempt %d: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    continue
+                raise
+        
+        # Все попытки исчерпаны
+        logger.error("[vk-media] All %d retry attempts failed for photo upload", max_retries)
+        if last_error:
+            raise last_error
+        raise RuntimeError("Photo upload failed after all retries")
 
     async def save_messages_photo(
         self, photo: str, server: int, hash_: str
@@ -116,56 +164,99 @@ class VKMediaService:
         return result
 
     async def upload_document(
-        self, upload_url: str, file_bytes: bytes, filename: str, mime_type: str
+        self, upload_url: str, file_bytes: bytes, filename: str, mime_type: str, max_retries: int = 3
     ) -> Dict[str, Any]:
-        """Upload document to VK server."""
+        """Upload document to VK server with retry logic."""
         client = await self._get_client()
-        # VK expects the field name to be exactly "file" for documents
-        logger.info("[vk-media] Uploading document to URL: %s...", upload_url[:200])
-        logger.info("[vk-media] File size: %d bytes, filename: %s, mime_type: %s", 
-                    len(file_bytes), filename, mime_type)
         
-        # Создаём BytesIO объект для файла
-        file_obj = io.BytesIO(file_bytes)
-        
-        # Формируем multipart/form-data запрос
-        # Имя поля должно быть именно "file" согласно документации VK
-        files = {"file": (filename, file_obj, mime_type)}
-        
-        # Добавляем заголовок Origin, так как VK может его требовать
-        headers = {
-            "Origin": "https://api.vk.ru",
-            "Referer": "https://api.vk.ru/",
-        }
-        
-        try:
-            resp = await client.post(upload_url, files=files, headers=headers)
-        except Exception as e:
-            logger.error("[vk-media] HTTP request failed: %s", e)
-            raise
-        
-        logger.info("[vk-media] Document upload response status: %d", resp.status_code)
-        logger.info("[vk-media] Response headers: %s", dict(resp.headers))
-        logger.info("[vk-media] Document upload response text (first 1000 chars): %s", resp.text[:1000])
-        
-        if resp.status_code != 200:
-            logger.error("[vk-media] Upload server returned non-200 status: %d", resp.status_code)
-            # Пробуем распарсить ответ даже при ошибке
+        last_error = None
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.warning("[vk-media] Retry attempt %d/%d for document upload", attempt + 1, max_retries)
+                await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+            
             try:
-                result = resp.json()
-                logger.error("[vk-media] Error response JSON: %s", result)
-            except:
-                pass
-            resp.raise_for_status()
+                # VK expects the field name to be exactly "file" for documents
+                logger.info("[vk-media] Uploading document to URL: %s...", upload_url[:200])
+                logger.info("[vk-media] File size: %d bytes, filename: %s, mime_type: %s (attempt %d)", 
+                            len(file_bytes), filename, mime_type, attempt + 1)
+                
+                # Создаём BytesIO объект для файла
+                file_obj = io.BytesIO(file_bytes)
+                
+                # Формируем multipart/form-data запрос
+                # Имя поля должно быть именно "file" согласно документации VK
+                files = {"file": (filename, file_obj, mime_type)}
+                
+                # Добавляем заголовки, так как VK может их требовать
+                headers = {
+                    "Origin": "https://api.vk.ru",
+                    "Referer": "https://api.vk.ru/",
+                    "User-Agent": "VKAndroidApp/5.199-23065 (Android 11; SDK 30; arm64-v8a; ru; 1920x1080)",
+                }
+                
+                # Используем отдельный клиент для загрузки файлов с follow_redirects
+                upload_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+                try:
+                    resp = await upload_client.post(upload_url, files=files, headers=headers)
+                finally:
+                    await upload_client.aclose()
+                
+                logger.info("[vk-media] Document upload response status: %d", resp.status_code)
+                logger.info("[vk-media] Response headers: %s", dict(resp.headers))
+                logger.info("[vk-media] Document upload response text (first 1000 chars): %s", resp.text[:1000])
+                
+                if resp.status_code == 405:
+                    logger.warning("[vk-media] Got 405 error, will retry...")
+                    last_error = httpx.HTTPStatusError(f"405 Method Not Allowed", request=resp.request, response=resp)
+                    continue
+                
+                if resp.status_code != 200:
+                    logger.error("[vk-media] Upload server returned non-200 status: %d", resp.status_code)
+                    # Пробуем распарсить ответ даже при ошибке
+                    try:
+                        result = resp.json()
+                        logger.error("[vk-media] Error response JSON: %s", result)
+                    except:
+                        pass
+                    resp.raise_for_status()
+                
+                try:
+                    result = resp.json()
+                    logger.info("[vk-media] Raw document upload response JSON: %s", result)
+                    
+                    # Проверяем, есть ли ошибка в ответе
+                    if isinstance(result, dict) and "error" in result:
+                        logger.error("[vk-media] Upload returned error: %s - %s", 
+                                    result.get("error"), result.get("error_descr"))
+                        if attempt < max_retries - 1:
+                            continue  # Пробуем ещё раз
+                        raise RuntimeError(f"VK upload error: {result.get('error')} - {result.get('error_descr')}")
+                    
+                    return result
+                except json.JSONDecodeError as e:
+                    logger.error("[vk-media] Failed to parse document upload JSON response: %s. Response text: %s", 
+                                e, resp.text[:500])
+                    raise
+                    
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.error("[vk-media] HTTP error on attempt %d: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    continue
+                raise
+            except Exception as e:
+                last_error = e
+                logger.error("[vk-media] Unexpected error on attempt %d: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    continue
+                raise
         
-        try:
-            result = resp.json()
-            logger.info("[vk-media] Raw document upload response JSON: %s", result)
-            return result
-        except json.JSONDecodeError as e:
-            logger.error("[vk-media] Failed to parse document upload JSON response: %s. Response text: %s", 
-                        e, resp.text[:500])
-            raise
+        # Все попытки исчерпаны
+        logger.error("[vk-media] All %d retry attempts failed", max_retries)
+        if last_error:
+            raise last_error
+        raise RuntimeError("Document upload failed after all retries")
 
     async def save_doc(self, file: str, title: str) -> Dict[str, Any]:
         """Save uploaded document."""
