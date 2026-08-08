@@ -502,3 +502,145 @@ class VKMediaService:
             mime_type="audio/ogg",
             doc_type="audio_message"
         )
+
+    async def upload_and_save_video(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        peer_id: int,
+        caption: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Загружает видео и возвращает строку вложения.
+        
+        Args:
+            file_bytes: Видео файл content
+            filename: Original filename
+            peer_id: Recipient peer ID
+            caption: Optional caption for the video
+        
+        Returns:
+            Attachment string like 'video100_555' or None if failed
+        """
+        try:
+            logger.info("[vk-media] Starting video upload for peer_id=%d, filename=%s", peer_id, filename)
+            
+            # Step 1: Создаём объект видео и получаем ссылку для загрузки
+            create_params = {"peer_id": peer_id}
+            if caption:
+                create_params["name"] = caption[:100]  # Ограничение VK на имя
+            
+            create_resp = await self._vk_call("video.create", create_params)
+            if not create_resp:
+                logger.error("[vk-media] Failed to create video object: %s", create_resp)
+                return None
+            
+            upload_url = create_resp.get("upload_url")
+            video_id = create_resp.get("video_id")
+            owner_id = create_resp.get("owner_id")
+            
+            if not upload_url or not video_id or owner_id is None:
+                logger.error("[vk-media] Invalid create response: %s", create_resp)
+                return None
+            
+            logger.info("[vk-media] Got video upload URL, video_id=%d, owner_id=%d", video_id, owner_id)
+            
+            # Step 2: Загружаем файл на полученный URL
+            mime_type = "video/mp4"  # VK принимает mp4
+            upload_result = await self._upload_video_to_url(upload_url, file_bytes, filename, mime_type)
+            
+            if not upload_result:
+                logger.error("[vk-media] Video upload failed")
+                return None
+            
+            # Step 3: Сохраняем видео (если требуется)
+            video_file = upload_result.get("video_file")
+            if video_file:
+                save_params = {
+                    "video_file": video_file,
+                    "video_id": video_id,
+                    "owner_id": owner_id,
+                }
+                if caption:
+                    save_params["name"] = caption[:100]
+                
+                save_resp = await self._vk_call("video.save", save_params)
+                if not save_resp:
+                    logger.warning("[vk-media] video.save returned empty, but video might be ready")
+                else:
+                    logger.info("[vk-media] Video saved successfully: %s", save_resp)
+            
+            # Формируем строку вложения
+            attachment_string = f"video{owner_id}_{video_id}"
+            logger.info("[vk-media] Built video attachment string: %s", attachment_string)
+            return attachment_string
+            
+        except Exception as e:
+            logger.exception("[vk-media] Failed to upload video: %s", e)
+            return None
+    
+    async def _upload_video_to_url(
+        self,
+        upload_url: str,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        max_retries: int = 3,
+    ) -> Optional[Dict[str, Any]]:
+        """Upload video file to VK upload URL with retry logic."""
+        last_error = None
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.warning("[vk-media] Retry attempt %d/%d for video upload", attempt + 1, max_retries)
+                await asyncio.sleep(0.5 * (attempt + 1))
+            
+            try:
+                # VK expects multipart form data with field name "file" for video upload
+                file_obj = io.BytesIO(file_bytes)
+                files = {"file": (filename, file_obj, mime_type)}
+                
+                logger.info("[vk-media] Uploading video to URL: %s... (attempt %d)", upload_url[:50], attempt + 1)
+                logger.info("[vk-media] Video size: %d bytes, filename: %s", len(file_bytes), filename)
+                
+                async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as upload_client:
+                    resp = await upload_client.post(upload_url, files=files)
+                    
+                    logger.info("[vk-media] Video upload response status: %d", resp.status_code)
+                    
+                    if resp.status_code != 200:
+                        logger.error("[vk-media] Video upload server returned non-200 status: %d", resp.status_code)
+                        last_error = Exception(f"Upload server returned {resp.status_code}")
+                        continue
+                    
+                    # Parse JSON response
+                    try:
+                        result = resp.json()
+                        logger.info("[vk-media] Raw video upload response JSON: %s", result)
+                        
+                        if isinstance(result, dict) and "error" in result:
+                            logger.error("[vk-media] Video upload error: %s - %s", 
+                                        result.get("error"), result.get("error_descr"))
+                            last_error = Exception(f"VK upload error: {result.get('error_descr')}")
+                            continue
+                        
+                        return result
+                    except json.JSONDecodeError as e:
+                        logger.error("[vk-media] Failed to parse video upload response JSON: %s", e)
+                        logger.error("[vk-media] Response text: %s", resp.text[:500])
+                        last_error = e
+                        continue
+                        
+            except httpx.HTTPStatusError as e:
+                logger.error("[vk-media] HTTP error during video upload: %s", e)
+                last_error = e
+            except httpx.RequestError as e:
+                logger.error("[vk-media] Request error during video upload: %s", e)
+                last_error = e
+            except Exception as e:
+                logger.error("[vk-media] Unexpected error during video upload: %s", e)
+                last_error = e
+        
+        logger.error("[vk-media] Video upload failed after %d attempts", max_retries)
+        if last_error:
+            logger.error("[vk-media] Last error: %s", last_error)
+        return None

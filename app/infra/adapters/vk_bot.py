@@ -291,15 +291,26 @@ class VkAdapter(MessengerAdapter):
                     )
                     logger.info("[vk] Audio document upload result: %s", attachment_string)
             else:
-                # Document (video, file, etc.)
-                logger.info("[vk] Uploading document (type=%s)...", content.media_type)
-                attachment_string = await self._media_service.upload_and_save_document(
-                    file_bytes=file_bytes,
-                    peer_id=peer_id,
-                    filename=filename,
-                    mime_type=mime_type
-                )
-                logger.info("[vk] Document upload result: %s", attachment_string)
+                # Check if it's a video file
+                if content.media_type == "video" or filename.endswith(('.mp4', '.avi', '.mov', '.mkv')) or mime_type.startswith('video/'):
+                    logger.info("[vk] Uploading video...")
+                    attachment_string = await self._media_service.upload_and_save_video(
+                        file_bytes=file_bytes,
+                        peer_id=peer_id,
+                        filename=filename,
+                        caption=content.caption,
+                    )
+                    logger.info("[vk] Video upload result: %s", attachment_string)
+                else:
+                    # Document (file, etc.)
+                    logger.info("[vk] Uploading document (type=%s)...", content.media_type)
+                    attachment_string = await self._media_service.upload_and_save_document(
+                        file_bytes=file_bytes,
+                        peer_id=peer_id,
+                        filename=filename,
+                        mime_type=mime_type
+                    )
+                    logger.info("[vk] Document upload result: %s", attachment_string)
             
             if attachment_string:
                 # Send message with attachment
