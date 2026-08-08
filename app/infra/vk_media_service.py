@@ -84,12 +84,13 @@ class VKMediaService:
                 await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
             
             try:
-                # Use multipart form data for upload - VK expects the field name to be exactly "photo"
-                files = {"photo": (filename, io.BytesIO(file_bytes), "image/jpeg")}
+                # VK expects multipart form data with field name "photo"
+                # Use tuple format: (filename, file_content, content_type)
+                files = {"photo": (filename, file_bytes, "image/jpeg")}
                 logger.info("[vk-media] Uploading to URL: %s... (attempt %d)", upload_url[:50], attempt + 1)
                 logger.info("[vk-media] File size: %d bytes, filename: %s", len(file_bytes), filename)
                 
-                # Используем отдельный клиент для загрузки файлов
+                # Use separate client for file uploads
                 upload_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
                 try:
                     resp = await upload_client.post(upload_url, files=files)
@@ -109,12 +110,12 @@ class VKMediaService:
                     result = resp.json()
                     logger.info("[vk-media] Raw upload response JSON: %s", result)
                     
-                    # Проверяем, есть ли ошибка в ответе
+                    # Check for errors in response
                     if isinstance(result, dict) and "error" in result:
                         logger.error("[vk-media] Photo upload returned error: %s - %s", 
                                     result.get("error"), result.get("error_descr"))
                         if attempt < max_retries - 1:
-                            continue  # Пробуем ещё раз
+                            continue  # Retry
                         raise RuntimeError(f"VK photo upload error: {result.get('error')} - {result.get('error_descr')}")
                     
                     return result
@@ -135,7 +136,7 @@ class VKMediaService:
                     continue
                 raise
         
-        # Все попытки исчерпаны
+        # All retries exhausted
         logger.error("[vk-media] All %d retry attempts failed for photo upload", max_retries)
         if last_error:
             raise last_error
