@@ -76,7 +76,10 @@ class VKMediaService:
         return result["upload_url"]
 
     async def upload_photo(self, upload_url: str, file_bytes: bytes, filename: str = "photo.jpg", max_retries: int = 3) -> Dict[str, Any]:
-        """Upload photo to VK server with retry logic."""
+        """Upload photo to VK server with retry logic.
+        
+        Для photos.getMessagesUploadServer поле должно называться 'photo'.
+        """
         last_error = None
         for attempt in range(max_retries):
             if attempt > 0:
@@ -84,18 +87,16 @@ class VKMediaService:
                 await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
             
             try:
-                # VK expects multipart form data with field name "photo"
-                # Use tuple format: (filename, file_content, content_type)
-                files = {"photo": (filename, file_bytes, "image/jpeg")}
+                # VK expects multipart form data with field name "photo" for this endpoint
+                # Обернём байты в BytesIO для надёжности
+                file_obj = io.BytesIO(file_bytes)
+                files = {"photo": (filename, file_obj, "image/jpeg")}
                 logger.info("[vk-media] Uploading to URL: %s... (attempt %d)", upload_url[:50], attempt + 1)
                 logger.info("[vk-media] File size: %d bytes, filename: %s", len(file_bytes), filename)
                 
-                # Use separate client for file uploads
-                upload_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
-                try:
+                # Use separate client for file uploads with explicit headers
+                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as upload_client:
                     resp = await upload_client.post(upload_url, files=files)
-                finally:
-                    await upload_client.aclose()
                     
                 logger.info("[vk-media] Upload response status: %d", resp.status_code)
                 logger.info("[vk-media] Upload response text (first 500 chars): %s", resp.text[:500])
