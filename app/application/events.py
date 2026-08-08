@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 from pyee.asyncio import AsyncIOEventEmitter
@@ -8,6 +8,7 @@ from app.application.chatwoot_service import ChatwootService
 from app.application.router import MessageRouter
 from app.config import AppConfig
 from app.infra.chatwoot_client import ChatwootClient
+from app.infra.vk_media_service import VKMediaService
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,100 @@ async def _fetch_vk_profile(
     except Exception as e:
         logger.warning("[vk] users.get failed: %s", e)
         return {}
+
+
+async def _process_vk_attachments_and_send_to_chatwoot(
+    cw: ChatwootService,
+    inbox_id: int,
+    peer_id: str,
+    from_id: str,
+    text: str,
+    files_bytes: List[bytes],
+    filenames: List[str],
+    vk_name: Optional[str],
+    custom_attributes: Dict[str, Any],
+    additional_attributes: Dict[str, Any],
+    avatar_url: Optional[str],
+) -> None:
+    """
+    Process VK incoming message with attachments and send to Chatwoot.
+    Files are sent as multipart attachments to Chatwoot.
+    """
+    try:
+        logger.info("[events-vk] Starting attachment processing: %d files", len(files_bytes))
+        
+        # Ensure contact first
+        ensured = await cw.ensure_contact(
+            inbox_id=inbox_id,
+            search_key=from_id,
+            name=vk_name or from_id,
+            phone=None,
+            email=None,
+            custom_attributes=custom_attributes,
+            additional_attributes=additional_attributes,
+            avatar_url=avatar_url,
+        )
+        logger.info("[events-vk] Contact ensured: id=%s", ensured.get("id"))
+
+        conv_id = await cw.ensure_conversation(
+            inbox_id=inbox_id,
+            contact_id=ensured["id"],
+            source_id=ensured["source_id"],
+        )
+        logger.info("[events-vk] Conversation ensured: id=%s", conv_id)
+
+        # Build files list for Chatwoot: (filename, file_bytes, mime_type)
+        files = []
+        for i, (file_bytes, filename) in enumerate(zip(files_bytes, filenames)):
+            # Determine MIME type from filename
+            mime_type = "application/octet-stream"
+            if filename.endswith(".jpg") or filename.endswith(".jpeg"):
+                mime_type = "image/jpeg"
+            elif filename.endswith(".png"):
+                mime_type = "image/png"
+            elif filename.endswith(".gif"):
+                mime_type = "image/gif"
+            elif filename.endswith(".ogg"):
+                mime_type = "audio/ogg"
+            elif filename.endswith(".mp3"):
+                mime_type = "audio/mpeg"
+            elif filename.endswith(".mp4"):
+                mime_type = "video/mp4"
+            elif filename.endswith(".pdf"):
+                mime_type = "application/pdf"
+            elif filename.endswith(".doc") or filename.endswith(".docx"):
+                mime_type = "application/msword"
+            
+            logger.info("[events-vk] File %d: %s (%d bytes, %s)", i, filename, len(file_bytes), mime_type)
+            files.append((filename, file_bytes, mime_type))
+
+        # Send message with attachments to Chatwoot
+        if files:
+            logger.info("[events-vk] Sending %d attachments to Chatwoot conv_id=%s", len(files), conv_id)
+            await cw._client.send_message_with_attachments(
+                conversation_id=conv_id,
+                content=text if text else None,
+                files=files,
+                message_type="incoming",
+            )
+            logger.info(
+                "[events] vk -> chatwoot OK conv_id=%s inbox=%s with %d attachments",
+                conv_id, inbox_id, len(files)
+            )
+        else:
+            # Fallback to text-only if no files processed
+            logger.warning("[events-vk] No files to send, falling back to text-only")
+            await cw.create_message(
+                conversation_id=conv_id,
+                content=text,
+                direction="incoming",
+            )
+            logger.info(
+                "[events] vk -> chatwoot OK conv_id=%s inbox=%s (text only fallback)",
+                conv_id, inbox_id
+            )
+    except Exception as e:
+        logger.exception("[events] vk attachments handling failed: %s", e)
 
 
 def wire_events(
@@ -111,7 +206,7 @@ def wire_events(
         - enrich contact with name (first+last; fallback to screen_name) and bdate
         - custom_attributes: vk_user_id, vk_peer_id, vk_bdate (if present)
         - additional_attributes: city (if present in users.get)
-        - rely on ensure_contact() to find by /contacts/filter
+        - handle attachments if present
         """
         try:
             message = payload.get("message") or {}
@@ -123,6 +218,7 @@ def wire_events(
             vk_name: Optional[str] = None
             vk_bdate: Optional[str] = None
             additional_attributes: Dict[str, Any] = {}
+            avatar_url: Optional[str] = None
 
             if config.vk:
                 profile = await _fetch_vk_profile(
@@ -134,7 +230,7 @@ def wire_events(
                 last = (profile.get("last_name") or "").strip()
                 screen_name = (profile.get("screen_name") or "").strip()
                 vk_bdate = (profile.get("bdate") or "").strip() or None
-                photo = (profile.get("photo_200") or "")
+                avatar_url = (profile.get("photo_200") or "")
 
                 # Extract city from profile; VK may return dict with "title" or a plain string
                 city_info = profile.get("city")
@@ -159,31 +255,53 @@ def wire_events(
             if vk_bdate:
                 custom_attributes["vk_bdate"] = vk_bdate
 
-            # Let ensure_contact handle attribute-first lookup
-            ensured = await cw.ensure_contact(
-                inbox_id=inbox_id,
-                search_key=from_id,
-                name=vk_name or from_id,
-                phone=None,
-                email=None,
-                custom_attributes=custom_attributes,
-                additional_attributes=additional_attributes,  # pass city here
-                avatar_url=photo
-            )
+            # Check for attachments (processed by VkAdapter and stored in payload)
+            files_bytes = payload.get("_files", [])
+            filenames = payload.get("_filenames", [])
 
-            conv_id = await cw.ensure_conversation(
-                inbox_id=inbox_id,
-                contact_id=ensured["id"],
-                source_id=ensured["source_id"],
-            )
-            await cw.create_message(
-                conversation_id=conv_id,
-                content=text,
-                direction="incoming",
-            )
-            logger.info(
-                "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
-            )
+            if files_bytes and filenames:
+                # Handle message with attachments
+                logger.info("[events] Processing VK message with %d attachments", len(files_bytes))
+                await _process_vk_attachments_and_send_to_chatwoot(
+                    cw=cw,
+                    inbox_id=inbox_id,
+                    peer_id=peer_id,
+                    from_id=from_id,
+                    text=text,
+                    files_bytes=files_bytes,
+                    filenames=filenames,
+                    vk_name=vk_name,
+                    custom_attributes=custom_attributes,
+                    additional_attributes=additional_attributes,
+                    avatar_url=avatar_url,
+                )
+            else:
+                # Handle text-only message
+                logger.info("[events] Processing VK text-only message: %s", text[:50] if text else "(empty)")
+                ensured = await cw.ensure_contact(
+                    inbox_id=inbox_id,
+                    search_key=from_id,
+                    name=vk_name or from_id,
+                    phone=None,
+                    email=None,
+                    custom_attributes=custom_attributes,
+                    additional_attributes=additional_attributes,
+                    avatar_url=avatar_url,
+                )
+
+                conv_id = await cw.ensure_conversation(
+                    inbox_id=inbox_id,
+                    contact_id=ensured["id"],
+                    source_id=ensured["source_id"],
+                )
+                await cw.create_message(
+                    conversation_id=conv_id,
+                    content=text,
+                    direction="incoming",
+                )
+                logger.info(
+                    "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
+                )
         except Exception as e:
             logger.exception("[events] vk handling failed: %s", e)
 

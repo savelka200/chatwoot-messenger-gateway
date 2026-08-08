@@ -1,7 +1,7 @@
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
-from app.domain.message import TextContent
+from app.domain.message import MediaContent, TextContent
 from app.domain.ports import MessengerAdapter
 from app.domain.webhooks.chatwoot import ChatwootMessageCreatedWebhook
 
@@ -19,7 +19,7 @@ def _dig(src: dict, *path, default=None):
 
 
 class MessageRouter:
-    """Router: dispatch outgoing text messages to channel adapters."""
+    """Router: dispatch outgoing messages (text and media) to channel adapters."""
 
     def __init__(self, adapters: Dict[str, MessengerAdapter] | None = None):
         self.adapters = adapters or {}
@@ -112,7 +112,8 @@ class MessageRouter:
 
     async def handle_outgoing(self, payload: dict) -> None:
         """
-        Process Chatwoot outgoing webhook and dispatch text to a proper adapter.
+        Process Chatwoot outgoing webhook and dispatch to a proper adapter.
+        Handles both text and media messages.
         Note: we trust channel injected at HTTP layer: payload['conversation']['meta']['channel'].
         """
         try:
@@ -138,18 +139,32 @@ class MessageRouter:
         # Always derive recipient_id (Chatwoot never provides it)
         recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
 
-        if not channel or not recipient_id or not text:
+        # Check for attachments in the payload
+        attachments = _dig(payload, "attachments", default=[])
+        
+        if not channel or not recipient_id:
             logger.warning(
-                "[router] Missing fields: channel=%r recipient_id=%r text=%r",
+                "[router] Missing fields: channel=%r recipient_id=%r",
                 channel,
                 recipient_id,
-                text,
             )
             return
 
-        await self.dispatch_outbound(
-            channel=channel, recipient_id=recipient_id, text=text
-        )
+        # Handle messages with attachments
+        if attachments:
+            await self.dispatch_outbound_with_attachments(
+                channel=channel,
+                recipient_id=recipient_id,
+                text=text,
+                attachments=attachments,
+            )
+        elif text:
+            # Text-only message
+            await self.dispatch_outbound(
+                channel=channel, recipient_id=recipient_id, text=text
+            )
+        else:
+            logger.warning("[router] No content or attachments in message")
 
     async def dispatch_outbound(
         self, channel: str, recipient_id: str, text: str
@@ -167,3 +182,75 @@ class MessageRouter:
             recipient_id,
             text,
         )
+
+    async def dispatch_outbound_with_attachments(
+        self,
+        channel: str,
+        recipient_id: str,
+        text: str,
+        attachments: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Send message with attachments via selected channel adapter.
+        
+        Args:
+            channel: Channel name (vk, telegram, whatsapp)
+            recipient_id: Recipient identifier
+            text: Message text/caption
+            attachments: List of attachment dicts from Chatwoot
+        """
+        adapter = self.adapters.get(channel)
+        if not adapter:
+            logger.warning("[router] No adapter for channel=%s", channel)
+            return
+
+        # Process attachments - Chatwoot provides them as list of dicts with url, file_type, etc.
+        for att in attachments:
+            try:
+                # Chatwoot returns attachment URL in 'data_url' field (not 'file_url' or 'url')
+                file_url = att.get("data_url") or att.get("file_url") or att.get("url")
+                if not file_url:
+                    logger.warning("[router] Attachment missing URL: %s", att)
+                    continue
+                
+                logger.info("[router] Processing attachment: url=%s file_type=%s", file_url, att.get("file_type"))
+                
+                # Determine media type from Chatwoot's file_type or content_type
+                file_type = att.get("file_type", "")
+                content_type = att.get("content_type", "")
+                
+                media_type = "document"  # default
+                if "image" in file_type or "image" in content_type:
+                    media_type = "image"
+                elif "audio" in file_type or "audio" in content_type:
+                    media_type = "audio"
+                elif "video" in file_type or "video" in content_type:
+                    media_type = "video"
+                
+                # Extract filename
+                filename = att.get("filename") or f"file_{att.get('id', 'unknown')}"
+                
+                content = MediaContent(
+                    type="media",
+                    media_type=media_type,
+                    url=file_url,
+                    caption=text if text else None,
+                    filename=filename,
+                    mime_type=content_type or None,
+                )
+                
+                logger.info("[router] Created MediaContent: media_type=%s url=%s caption=%s filename=%s",
+                           media_type, file_url[:80] if file_url else None, 
+                           text[:50] if text else None, filename)
+                
+                await adapter.send_media(recipient_id, content)
+                logger.info(
+                    "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s url=%s",
+                    channel,
+                    recipient_id,
+                    filename,
+                    media_type,
+                    file_url,
+                )
+            except Exception as e:
+                logger.exception("[router] Failed to send attachment: %s", e)

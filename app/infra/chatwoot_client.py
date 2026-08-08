@@ -1,6 +1,9 @@
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class ChatwootClient:
@@ -176,5 +179,62 @@ class ChatwootClient:
 
         async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
             r = await client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+    async def send_message_with_attachments(
+        self,
+        conversation_id: int,
+        content: Optional[str],
+        files: List[Tuple[str, bytes, str]],
+        **extra_fields: Any,
+    ) -> Dict[str, Any]:
+        """
+        Send a message with file attachments to a conversation.
+        
+        Args:
+            conversation_id: Chatwoot conversation ID
+            content: Message text (can be None if only attachments)
+            files: List of tuples (filename, file_bytes, mime_type)
+            extra_fields: Additional fields like message_type
+        
+        Returns:
+            Response data from Chatwoot API
+        """
+        url = f"{self._account_base}/conversations/{conversation_id}/messages"
+        
+        # Build multipart form data
+        form_data = httpx.FormData()
+        if content:
+            form_data.add_field("content", content)
+        else:
+            form_data.add_field("content", "")
+        
+        # Add message_type if provided
+        message_type = extra_fields.get("message_type")
+        if message_type:
+            form_data.add_field("message_type", message_type)
+        
+        # Add attachments[] field for each file - Chatwoot expects this exact field name
+        for idx, (filename, file_bytes, mime_type) in enumerate(files):
+            logger.info("[chatwoot-client] Adding attachment %d: %s (%d bytes, %s)", 
+                       idx, filename, len(file_bytes), mime_type)
+            form_data.add_field(
+                "attachments[]",
+                file_bytes,
+                filename=filename,
+                content_type=mime_type
+            )
+        
+        # Custom headers without Content-Type (httpx will set it with boundary)
+        headers = {
+            "api_access_token": self._headers["api_access_token"],
+            "Authorization": self._headers["Authorization"],
+        }
+        
+        logger.info("[chatwoot-client] Sending multipart message to %s with %d files", url, len(files))
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(url, headers=headers, content=form_data)
+            logger.info("[chatwoot-client] Response status: %d, body: %s", r.status_code, r.text[:500])
             r.raise_for_status()
             return r.json()
