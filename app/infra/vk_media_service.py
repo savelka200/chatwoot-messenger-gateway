@@ -118,10 +118,23 @@ class VKMediaService:
     ) -> Dict[str, Any]:
         """Upload document to VK server."""
         client = await self._get_client()
-        files = {"file": (filename, file_bytes, mime_type)}
+        # VK expects the field name to be exactly "file" for documents
+        files = {"file": (filename, io.BytesIO(file_bytes), mime_type)}
+        logger.info("[vk-media] Uploading document to URL: %s...", upload_url[:50])
+        logger.info("[vk-media] File size: %d bytes, filename: %s, mime_type: %s", 
+                    len(file_bytes), filename, mime_type)
         resp = await client.post(upload_url, files=files)
+        logger.info("[vk-media] Document upload response status: %d", resp.status_code)
+        logger.info("[vk-media] Document upload response text (first 500 chars): %s", resp.text[:500])
         resp.raise_for_status()
-        return resp.json()
+        try:
+            result = resp.json()
+            logger.info("[vk-media] Raw document upload response JSON: %s", result)
+            return result
+        except json.JSONDecodeError as e:
+            logger.error("[vk-media] Failed to parse document upload JSON response: %s. Response text: %s", 
+                        e, resp.text[:500])
+            raise
 
     async def save_doc(self, file: str, title: str) -> Dict[str, Any]:
         """Save uploaded document."""
