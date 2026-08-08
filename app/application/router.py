@@ -207,10 +207,13 @@ class MessageRouter:
         # Process attachments - Chatwoot provides them as list of dicts with url, file_type, etc.
         for att in attachments:
             try:
-                file_url = att.get("file_url") or att.get("url")
+                # Chatwoot returns attachment URL in 'data_url' field (not 'file_url' or 'url')
+                file_url = att.get("data_url") or att.get("file_url") or att.get("url")
                 if not file_url:
                     logger.warning("[router] Attachment missing URL: %s", att)
                     continue
+                
+                logger.info("[router] Processing attachment: url=%s file_type=%s", file_url, att.get("file_type"))
                 
                 # Determine media type from Chatwoot's file_type or content_type
                 file_type = att.get("file_type", "")
@@ -238,11 +241,12 @@ class MessageRouter:
                 
                 await adapter.send_media(recipient_id, content)
                 logger.info(
-                    "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s",
+                    "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s url=%s",
                     channel,
                     recipient_id,
                     filename,
                     media_type,
+                    file_url,
                 )
             except Exception as e:
                 logger.exception("[router] Failed to send attachment: %s", e)

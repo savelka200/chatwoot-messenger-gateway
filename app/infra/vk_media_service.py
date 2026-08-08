@@ -126,11 +126,16 @@ class VKMediaService:
         files_bytes = []
         filenames = []
         
+        logger.info("[vk-media] Processing %d attachments", len(attachments))
+        
         for att in attachments:
             att_type = att.get("type")
+            logger.info("[vk-media] Processing attachment type: %s", att_type)
             try:
                 if att_type == "photo":
                     photo_obj = att.get("photo", {})
+                    logger.info("[vk-media] Photo object: id=%s sizes_count=%d", 
+                                photo_obj.get("id"), len(photo_obj.get("sizes", [])))
                     # Get the largest size URL
                     sizes = photo_obj.get("sizes", [])
                     if sizes:
@@ -138,31 +143,48 @@ class VKMediaService:
                         largest = max(sizes, key=lambda s: s.get("width", 0))
                         url = largest.get("url") or photo_obj.get("photo_2521") or photo_obj.get("photo_1280") or photo_obj.get("photo_807") or photo_obj.get("photo_604")
                         if url:
+                            logger.info("[vk-media] Downloading photo from: %s", url[:80])
                             file_bytes = await self.download_file(url)
                             files_bytes.append(file_bytes)
                             filenames.append(f"photo_{photo_obj.get('id', 'unknown')}.jpg")
+                            logger.info("[vk-media] Downloaded %d bytes as %s", len(file_bytes), filenames[-1])
+                        else:
+                            logger.warning("[vk-media] No photo URL found in sizes")
+                    else:
+                        logger.warning("[vk-media] No sizes in photo object")
                 
                 elif att_type == "doc":
                     doc_obj = att.get("doc", {})
                     url = doc_obj.get("url")
+                    logger.info("[vk-media] Document: id=%s url_present=%s", 
+                                doc_obj.get("id"), url is not None)
                     if url:
                         file_bytes = await self.download_file(url)
                         files_bytes.append(file_bytes)
                         filename = doc_obj.get("title", f"doc_{doc_obj.get('id', 'unknown')}")
                         filenames.append(filename)
+                        logger.info("[vk-media] Downloaded %d bytes as %s", len(file_bytes), filename)
+                    else:
+                        logger.warning("[vk-media] No URL in document object")
                 
                 elif att_type == "audio_message":
                     audio_obj = att.get("audio_message", {})
                     url = audio_obj.get("link") or audio_obj.get("url")
+                    logger.info("[vk-media] Audio message: id=%s url_present=%s", 
+                                audio_obj.get("id"), url is not None)
                     if url:
                         file_bytes = await self.download_file(url, timeout=120.0)
                         files_bytes.append(file_bytes)
                         filenames.append(f"voice_{audio_obj.get('id', 'unknown')}.ogg")
+                        logger.info("[vk-media] Downloaded %d bytes as %s", len(file_bytes), filenames[-1])
+                    else:
+                        logger.warning("[vk-media] No URL in audio_message object")
                 
                 elif att_type == "video":
                     # Video attachments are tricky - VK usually sends a link, not direct file
                     video_obj = att.get("video", {})
-                    logger.info("[vk-media] Video attachment detected, skipping file download: %s", video_obj.get("id"))
+                    logger.info("[vk-media] Video attachment detected, skipping file download: %s", 
+                                video_obj.get("id"))
                 
                 else:
                     logger.warning("[vk-media] Unknown attachment type: %s", att_type)
@@ -170,6 +192,7 @@ class VKMediaService:
             except Exception as e:
                 logger.exception("[vk-media] Failed to process attachment %s: %s", att_type, e)
         
+        logger.info("[vk-media] Successfully processed %d/%d attachments", len(files_bytes), len(attachments))
         return files_bytes, filenames
 
     def build_attachment_string(self, media_type: str, owner_id: int, media_id: int) -> str:
@@ -184,23 +207,41 @@ class VKMediaService:
             Attachment string like 'photo100_555' or None if failed
         """
         try:
+            logger.info("[vk-media] Starting photo upload for peer_id=%d", peer_id)
+            
             # Step 1: Get upload server
             upload_url = await self.get_photo_upload_server()
+            logger.info("[vk-media] Got photo upload server URL")
             
             # Step 2: Upload photo
+            logger.info("[vk-media] Uploading %d bytes to VK...", len(file_bytes))
             upload_result = await self.upload_photo(upload_url, file_bytes)
+            logger.info("[vk-media] Upload response: %s", upload_result.keys() if isinstance(upload_result, dict) else type(upload_result))
             
             # Step 3: Save photo
             photo_str = upload_result.get("photo", "")
             server = upload_result.get("server", 0)
             hash_val = upload_result.get("hash", "")
+            logger.info("[vk-media] Photo upload result: photo_len=%d server=%s hash=%s", 
+                        len(photo_str) if photo_str else 0, server, hash_val[:20] if hash_val else None)
+            
+            if not photo_str or not server or not hash_val:
+                logger.error("[vk-media] Missing required fields in upload result: photo=%s server=%s hash=%s",
+                            bool(photo_str), server, bool(hash_val))
+                return None
             
             saved = await self.save_messages_photo(photo_str, server, hash_val)
+            logger.info("[vk-media] Save result: %s", saved)
+            
             if saved:
                 photo_data = saved[0]
                 owner_id = photo_data.get("owner_id", -self._group_id)
                 photo_id = photo_data.get("id", 0)
-                return self.build_attachment_string("photo", owner_id, photo_id)
+                result = self.build_attachment_string("photo", owner_id, photo_id)
+                logger.info("[vk-media] Built attachment string: %s", result)
+                return result
+            else:
+                logger.error("[vk-media] save_messages_photo returned empty result")
         except Exception as e:
             logger.exception("[vk-media] Failed to upload photo: %s", e)
         return None
@@ -227,21 +268,43 @@ class VKMediaService:
             Attachment string like 'doc100_555' or None if failed
         """
         try:
+            logger.info("[vk-media] Starting document upload: filename=%s mime_type=%s doc_type=%s",
+                        filename, mime_type, doc_type)
+            
             # Step 1: Get upload server
             server_info = await self.get_doc_upload_server(peer_id, doc_type)
             upload_url = server_info.get("upload_url", "")
+            logger.info("[vk-media] Got document upload server URL")
+            
+            if not upload_url:
+                logger.error("[vk-media] Empty upload URL from server")
+                return None
             
             # Step 2: Upload document
+            logger.info("[vk-media] Uploading %d bytes to VK...", len(file_bytes))
             upload_result = await self.upload_document(upload_url, file_bytes, filename, mime_type)
+            logger.info("[vk-media] Upload response keys: %s", upload_result.keys() if isinstance(upload_result, dict) else type(upload_result))
             
             # Step 3: Save document
             file_str = upload_result.get("file", "")
+            logger.info("[vk-media] Document upload result: file_len=%d", len(file_str) if file_str else 0)
+            
+            if not file_str:
+                logger.error("[vk-media] Missing 'file' field in upload result")
+                return None
+            
             saved = await self.save_doc(file_str, filename)
+            logger.info("[vk-media] Save result: %s", saved)
+            
             if saved:
                 doc_data = saved
                 owner_id = doc_data.get("owner_id", -self._group_id)
                 doc_id = doc_data.get("id", 0)
-                return self.build_attachment_string("doc", owner_id, doc_id)
+                result = self.build_attachment_string("doc", owner_id, doc_id)
+                logger.info("[vk-media] Built attachment string: %s", result)
+                return result
+            else:
+                logger.error("[vk-media] docs.save returned empty result")
         except Exception as e:
             logger.exception("[vk-media] Failed to upload document: %s", e)
         return None

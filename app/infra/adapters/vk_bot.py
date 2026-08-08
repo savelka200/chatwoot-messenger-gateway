@@ -203,7 +203,8 @@ class VkAdapter(MessengerAdapter):
         This method handles outgoing messages from Chatwoot that contain attachments.
         It downloads files from Chatwoot URLs and uploads them to VK servers.
         """
-        logger.info("[vk] send_media called with content type: %s", content.media_type)
+        logger.info("[vk] send_media called: media_type=%s url=%s filename=%s caption=%s", 
+                    content.media_type, content.url, content.filename, content.caption)
         
         # For outgoing messages from Chatwoot, the URL will be a downloadable link
         # We need to get the actual file bytes from Chatwoot's attachment URLs
@@ -215,45 +216,56 @@ class VkAdapter(MessengerAdapter):
         
         try:
             # Download file from Chatwoot URL
+            logger.info("[vk] Downloading file from Chatwoot: %s", content.url)
             file_bytes = await self._media_service.download_file(str(content.url), timeout=60.0)
+            logger.info("[vk] Downloaded %d bytes from %s", len(file_bytes), content.url)
             
             # Determine filename and MIME type
             filename = content.filename or f"file_{secrets.randbits(32)}"
             mime_type = content.mime_type or "application/octet-stream"
+            logger.info("[vk] File info: filename=%s mime_type=%s", filename, mime_type)
             
             # Determine upload method based on media type
             attachment_string = None
             peer_id = int(recipient_id)
             
             if content.media_type == "image":
+                logger.info("[vk] Uploading photo...")
                 attachment_string = await self._media_service.upload_and_save_photo(
                     file_bytes=file_bytes,
                     peer_id=peer_id
                 )
+                logger.info("[vk] Photo upload result: %s", attachment_string)
             elif content.media_type == "audio":
                 # Check if it's a voice message (ogg format)
                 if filename.endswith(".ogg") or mime_type == "audio/ogg":
+                    logger.info("[vk] Uploading voice message (ogg)...")
                     attachment_string = await self._media_service.upload_and_save_audio_message(
                         file_bytes=file_bytes,
                         peer_id=peer_id,
                         filename=filename
                     )
+                    logger.info("[vk] Voice message upload result: %s", attachment_string)
                 else:
                     # Regular audio document
+                    logger.info("[vk] Uploading audio as document...")
                     attachment_string = await self._media_service.upload_and_save_document(
                         file_bytes=file_bytes,
                         peer_id=peer_id,
                         filename=filename,
                         mime_type=mime_type
                     )
+                    logger.info("[vk] Audio document upload result: %s", attachment_string)
             else:
                 # Document (video, file, etc.)
+                logger.info("[vk] Uploading document (type=%s)...", content.media_type)
                 attachment_string = await self._media_service.upload_and_save_document(
                     file_bytes=file_bytes,
                     peer_id=peer_id,
                     filename=filename,
                     mime_type=mime_type
                 )
+                logger.info("[vk] Document upload result: %s", attachment_string)
             
             if attachment_string:
                 # Send message with attachment
@@ -268,6 +280,9 @@ class VkAdapter(MessengerAdapter):
                 # Add caption/text if present
                 if content.caption:
                     params["message"] = content.caption
+                    logger.info("[vk] Sending media with caption: %s", content.caption)
+                else:
+                    logger.info("[vk] Sending media without caption")
                 
                 res = await self._vk_call("messages.send", params)
                 logger.info("[vk] SENT MEDIA: peer_id=%s attachment=%s result=%s", recipient_id, attachment_string, res)
