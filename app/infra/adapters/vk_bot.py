@@ -231,9 +231,12 @@ class VkAdapter(MessengerAdapter):
             
             if content.media_type == "image":
                 logger.info("[vk] Uploading photo...")
+                # Use a proper filename for photo upload
+                photo_filename = filename if filename.endswith(('.jpg', '.jpeg', '.png', '.gif')) else "photo.jpg"
                 attachment_string = await self._media_service.upload_and_save_photo(
                     file_bytes=file_bytes,
-                    peer_id=peer_id
+                    peer_id=peer_id,
+                    filename=photo_filename
                 )
                 logger.info("[vk] Photo upload result: %s", attachment_string)
             elif content.media_type == "audio":

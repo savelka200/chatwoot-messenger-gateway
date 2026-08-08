@@ -1,6 +1,7 @@
 """VK Media Service - handles media upload/download operations with VK API."""
 
 import io
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,14 +74,24 @@ class VKMediaService:
         result = await self._vk_call("photos.getMessagesUploadServer", {})
         return result["upload_url"]
 
-    async def upload_photo(self, upload_url: str, file_bytes: bytes) -> Dict[str, Any]:
+    async def upload_photo(self, upload_url: str, file_bytes: bytes, filename: str = "photo.jpg") -> Dict[str, Any]:
         """Upload photo to VK server."""
         client = await self._get_client()
-        # Use multipart form data for upload
-        files = {"photo": ("photo.jpg", file_bytes, "image/jpeg")}
+        # Use multipart form data for upload - VK expects the field name to be exactly "photo"
+        files = {"photo": (filename, file_bytes, "image/jpeg")}
+        logger.info("[vk-media] Uploading to URL: %s...", upload_url[:50])
+        logger.info("[vk-media] File size: %d bytes, filename: %s", len(file_bytes), filename)
         resp = await client.post(upload_url, files=files)
+        logger.info("[vk-media] Upload response status: %d", resp.status_code)
+        logger.info("[vk-media] Upload response text (first 500 chars): %s", resp.text[:500])
         resp.raise_for_status()
-        return resp.json()
+        try:
+            result = resp.json()
+            logger.info("[vk-media] Raw upload response JSON: %s", result)
+            return result
+        except json.JSONDecodeError as e:
+            logger.error("[vk-media] Failed to parse JSON response: %s. Response text: %s", e, resp.text[:500])
+            raise
 
     async def save_messages_photo(
         self, photo: str, server: int, hash_: str
@@ -202,24 +213,29 @@ class VKMediaService:
         """Build VK attachment string format: <type><owner_id>_<media_id>."""
         return f"{media_type}{owner_id}_{media_id}"
 
-    async def upload_and_save_photo(self, file_bytes: bytes, peer_id: int) -> Optional[str]:
+    async def upload_and_save_photo(self, file_bytes: bytes, peer_id: int, filename: str = "photo.jpg") -> Optional[str]:
         """
         Upload photo to VK and return attachment string.
+        
+        Args:
+            file_bytes: Photo file content
+            peer_id: Recipient peer ID  
+            filename: Filename for the upload (should end with .jpg, .png, etc.)
         
         Returns:
             Attachment string like 'photo100_555' or None if failed
         """
         try:
-            logger.info("[vk-media] Starting photo upload for peer_id=%d", peer_id)
+            logger.info("[vk-media] Starting photo upload for peer_id=%d filename=%s", peer_id, filename)
             
             # Step 1: Get upload server
             upload_url = await self.get_photo_upload_server()
-            logger.info("[vk-media] Got photo upload server URL")
+            logger.info("[vk-media] Got photo upload server URL: %s...", upload_url[:60])
             
             # Step 2: Upload photo
             logger.info("[vk-media] Uploading %d bytes to VK...", len(file_bytes))
-            upload_result = await self.upload_photo(upload_url, file_bytes)
-            logger.info("[vk-media] Upload response: %s", upload_result.keys() if isinstance(upload_result, dict) else type(upload_result))
+            upload_result = await self.upload_photo(upload_url, file_bytes, filename=filename)
+            logger.info("[vk-media] Upload response keys: %s", list(upload_result.keys()) if isinstance(upload_result, dict) else type(upload_result))
             
             # Step 3: Save photo
             photo_str = upload_result.get("photo", "")
@@ -231,6 +247,7 @@ class VKMediaService:
             if not photo_str or not server or not hash_val:
                 logger.error("[vk-media] Missing required fields in upload result: photo=%s server=%s hash=%s",
                             bool(photo_str), server, bool(hash_val))
+                logger.error("[vk-media] Full upload result: %s", upload_result)
                 return None
             
             saved = await self.save_messages_photo(photo_str, server, hash_val)
