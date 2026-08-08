@@ -110,7 +110,9 @@ class VKMediaService:
         params = {"peer_id": peer_id}
         if doc_type:
             params["type"] = doc_type
+        logger.info("[vk-media] Calling docs.getMessagesUploadServer with params: %s", params)
         result = await self._vk_call("docs.getMessagesUploadServer", params)
+        logger.info("[vk-media] Got upload server response: %s", {k: v for k, v in result.items() if k != 'upload_url'})
         return result
 
     async def upload_document(
@@ -119,14 +121,43 @@ class VKMediaService:
         """Upload document to VK server."""
         client = await self._get_client()
         # VK expects the field name to be exactly "file" for documents
-        files = {"file": (filename, io.BytesIO(file_bytes), mime_type)}
-        logger.info("[vk-media] Uploading document to URL: %s...", upload_url[:50])
+        logger.info("[vk-media] Uploading document to URL: %s...", upload_url[:200])
         logger.info("[vk-media] File size: %d bytes, filename: %s, mime_type: %s", 
                     len(file_bytes), filename, mime_type)
-        resp = await client.post(upload_url, files=files)
+        
+        # Создаём BytesIO объект для файла
+        file_obj = io.BytesIO(file_bytes)
+        
+        # Формируем multipart/form-data запрос
+        # Имя поля должно быть именно "file" согласно документации VK
+        files = {"file": (filename, file_obj, mime_type)}
+        
+        # Добавляем заголовок Origin, так как VK может его требовать
+        headers = {
+            "Origin": "https://api.vk.ru",
+            "Referer": "https://api.vk.ru/",
+        }
+        
+        try:
+            resp = await client.post(upload_url, files=files, headers=headers)
+        except Exception as e:
+            logger.error("[vk-media] HTTP request failed: %s", e)
+            raise
+        
         logger.info("[vk-media] Document upload response status: %d", resp.status_code)
-        logger.info("[vk-media] Document upload response text (first 500 chars): %s", resp.text[:500])
-        resp.raise_for_status()
+        logger.info("[vk-media] Response headers: %s", dict(resp.headers))
+        logger.info("[vk-media] Document upload response text (first 1000 chars): %s", resp.text[:1000])
+        
+        if resp.status_code != 200:
+            logger.error("[vk-media] Upload server returned non-200 status: %d", resp.status_code)
+            # Пробуем распарсить ответ даже при ошибке
+            try:
+                result = resp.json()
+                logger.error("[vk-media] Error response JSON: %s", result)
+            except:
+                pass
+            resp.raise_for_status()
+        
         try:
             result = resp.json()
             logger.info("[vk-media] Raw document upload response JSON: %s", result)

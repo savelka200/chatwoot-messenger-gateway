@@ -4,30 +4,6 @@
 __pycache__/
 
 # Virtual environments
-venv/
 .venv/
-.env
-.env.local
-*.env.*
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.swp
-
-# Coverage reports
-.coverage
-coverage/
-htmlcov/
-
-# VS Code settings
-.vscode/
-
-# Pytest cache
-.pytest_cache/
-
-# MyPy cache
-.mypy_cache/
+venv/
 ```
