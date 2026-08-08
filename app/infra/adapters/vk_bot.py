@@ -221,7 +221,38 @@ class VkAdapter(MessengerAdapter):
             logger.info("[vk] Downloaded %d bytes from %s", len(file_bytes), content.url)
             
             # Determine filename and MIME type
+            # IMPORTANT: VK requires the original filename with extension for document uploads
+            # Extract filename from URL if not provided or if it's a generic name
             filename = content.filename or f"file_{secrets.randbits(32)}"
+            
+            # If filename doesn't have an extension, try to extract it from the URL
+            if '.' not in filename or filename.startswith('file_'):
+                # Extract filename from URL path
+                from urllib.parse import unquote, urlparse
+                parsed_url = urlparse(str(content.url))
+                url_filename = unquote(parsed_url.path.split('/')[-1]) if parsed_url.path else ""
+                if url_filename and '.' in url_filename:
+                    filename = url_filename
+                    logger.info("[vk] Using filename from URL: %s", filename)
+                elif content.mime_type:
+                    # Fallback: generate filename from MIME type
+                    ext_map = {
+                        'image/jpeg': '.jpg',
+                        'image/png': '.png',
+                        'image/gif': '.gif',
+                        'application/pdf': '.pdf',
+                        'application/msword': '.doc',
+                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+                        'application/vnd.ms-excel': '.xls',
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+                        'audio/ogg': '.ogg',
+                        'audio/mpeg': '.mp3',
+                        'video/mp4': '.mp4',
+                    }
+                    ext = ext_map.get(content.mime_type, '.bin')
+                    filename = f"file_{secrets.randbits(32)}{ext}"
+                    logger.info("[vk] Generated filename from MIME type: %s", filename)
+            
             mime_type = content.mime_type or "application/octet-stream"
             logger.info("[vk] File info: filename=%s mime_type=%s", filename, mime_type)
             

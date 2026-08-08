@@ -1,9 +1,1 @@
-```
-# Compiled Python files
-*.pyc
-__pycache__/
-
-# Virtual environments
-.venv/
-venv/
-```
+Nothing should be ignored in this case, as only a Python source file (`app/infra/adapters/vk_bot.py`) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
