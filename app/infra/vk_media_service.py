@@ -341,8 +341,8 @@ class VKMediaService:
                     video_obj = att.get("video", {})
                     video_id = video_obj.get("id")
                     owner_id = video_obj.get("owner_id")
-                    logger.info("[vk-media] Video attachment detected: id=%s owner_id=%s", 
-                                video_id, owner_id)
+                    logger.info("[vk-media] Video attachment detected: id=%s owner_id=%s processing=%s", 
+                                video_id, owner_id, video_obj.get("processing"))
                     
                     url = None
                     file_bytes = None
@@ -388,19 +388,26 @@ class VKMediaService:
                         except Exception as e:
                             logger.warning("[vk-media] Failed to download video file: %s. Will use thumbnail instead.", e)
                     
-                    # If video download failed or no URL, use thumbnail
+                    # If video download failed or no URL, use thumbnail/preview
                     if file_bytes is None:
-                        images = video_obj.get("image", [])
+                        # First try first_frame if available (higher quality)
+                        images = video_obj.get("first_frame", [])
+                        if not images:
+                            # Fall back to image array
+                            images = video_obj.get("image", [])
+                        
                         if isinstance(images, list) and images:
-                            # Find the largest thumbnail
-                            largest_img = max(images, key=lambda img: img.get("width", 0))
+                            # Find the largest thumbnail by width*height
+                            def get_area(img):
+                                return img.get("width", 0) * img.get("height", 0)
+                            largest_img = max(images, key=get_area)
                             thumb_url = largest_img.get("url")
                             if thumb_url:
                                 logger.info("[vk-media] Downloading video thumbnail from: %s", thumb_url[:80])
                                 try:
-                                    file_bytes = await self.download_file(thumb_url)
+                                    file_bytes = await self.download_file(thumb_url, timeout=30.0)
                                     files_bytes.append(file_bytes)
-                                    thumb_filename = f"video_{video_id}_thumbnail.jpg"
+                                    thumb_filename = f"video_{video_id}_preview.jpg"
                                     filenames.append(thumb_filename)
                                     logger.info("[vk-media] Downloaded thumbnail %d bytes as %s", len(file_bytes), thumb_filename)
                                 except Exception as e:
