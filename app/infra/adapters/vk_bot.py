@@ -1,5 +1,5 @@
-import base64
 import logging
+import secrets
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx  # NEW
@@ -60,65 +60,21 @@ class VkAdapter(MessengerAdapter):
                 str(msg.get("from_id")) if msg.get("from_id") is not None else peer_id
             )
             message_id = str(msg.get("id")) if msg.get("id") is not None else None
-            
-            # Process attachments if present
-            attachments = msg.get("attachments", [])
-            files_bytes = []
-            filenames = []
-            
-            if attachments and self._media_service:
-                try:
-                    files_bytes, filenames = await self._media_service.process_incoming_attachments(attachments)
-                except Exception as e:
-                    logger.exception("[vk] Failed to process attachments: %s", e)
 
             if not self._cb or not peer_id:
                 logger.debug("[vk] skip incoming: no callback or missing peer_id")
                 return
 
-            # Build content based on whether we have text or attachments
-            if files_bytes:
-                # Use first file for MediaContent (VK typically sends one attachment per message)
-                # If multiple attachments, they come as separate messages
-                # Encode file bytes to base64 and create data URL
-                first_file = files_bytes[0]
-                first_filename = filenames[0] if filenames else "photo.jpg"
-                
-                # Determine MIME type from filename
-                mime_type = "application/octet-stream"
-                if first_filename.endswith(('.jpg', '.jpeg')):
-                    mime_type = "image/jpeg"
-                elif first_filename.endswith('.png'):
-                    mime_type = "image/png"
-                elif first_filename.endswith('.gif'):
-                    mime_type = "image/gif"
-                
-                # Create base64 encoded data URL
-                base64_data = base64.b64encode(first_file).decode('utf-8')
-                data_url = f"data:{mime_type};base64,{base64_data}"
-                
-                logger.info("[vk] Created MediaContent with base64 data URL: len=%d mime=%s", len(base64_data), mime_type)
-                
-                content = MediaContent(
-                    type="media",
-                    media_type="image" if "image" in mime_type else "document",
-                    url=data_url,
-                    caption=text if text else None,
-                    filename=first_filename,
-                    mime_type=mime_type,
-                )
-                # Store file bytes in raw for downstream processing
-                raw_data = {**payload, "_files": files_bytes, "_filenames": filenames}
-            else:
-                content = TextContent(type="text", text=text)
-                raw_data = payload
+            # Pass payload with attachments info to the callback
+            # Attachments will be processed by events._ingest_vk handler
+            raw_data = payload
 
             umsg = UnifiedMessage(
                 channel="vk",
                 sender_id=from_id,
                 recipient_id=peer_id,
                 message_id=message_id,
-                content=content,
+                content=TextContent(type="text", text=text),
                 raw=raw_data,
             )
             await self._cb(umsg)
