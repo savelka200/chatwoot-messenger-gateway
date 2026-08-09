@@ -337,51 +337,62 @@ class VKMediaService:
                         logger.warning("[vk-media] No URL in audio_message object")
                 
                 elif att_type == "video":
-                    # Video attachments - try to download the video file
+                    # Video attachments - need to call video.get API to get direct URL
                     video_obj = att.get("video", {})
+                    video_id = video_obj.get("id")
+                    owner_id = video_obj.get("owner_id")
                     logger.info("[vk-media] Video attachment detected: id=%s owner_id=%s", 
-                                video_obj.get("id"), video_obj.get("owner_id"))
+                                video_id, owner_id)
                     
-                    # Try to get direct video URL from different possible fields
                     url = None
+                    file_bytes = None
                     
-                    # Check for direct file URLs in 'files' field (VK sometimes provides this)
-                    files_dict = video_obj.get("files", {})
-                    if isinstance(files_dict, dict):
-                        # Try to get the best quality available (mp4_1080, mp4_720, mp4_480, mp4_360, mp4_240)
-                        for quality in ["mp4_1080", "mp4_720", "mp4_480", "mp4_360", "mp4_240"]:
-                            if quality in files_dict and files_dict[quality]:
-                                url = files_dict[quality]
-                                logger.info("[vk-media] Found video URL for quality %s: %s", quality, url[:80])
-                                break
+                    # Try to get direct video URL by calling video.get API
+                    if video_id and owner_id:
+                        try:
+                            logger.info("[vk-media] Calling video.get for video %s (owner %s)", video_id, owner_id)
+                            video_data = await self._vk_call(
+                                "video.get",
+                                {"videos": f"{owner_id}_{video_id}", "count": 1}
+                            )
+                            items = video_data.get("items", [])
+                            if items:
+                                video_info = items[0]
+                                # Check for direct file URLs in 'files' field
+                                files_dict = video_info.get("files", {})
+                                if isinstance(files_dict, dict):
+                                    for quality in ["mp4_1080", "mp4_720", "mp4_480", "mp4_360", "mp4_240"]:
+                                        if quality in files_dict and files_dict[quality]:
+                                            url = files_dict[quality]
+                                            logger.info("[vk-media] Found video URL for quality %s: %s", quality, url[:80])
+                                            break
+                                
+                                # If no files, try 'player' or 'url' field
+                                if not url:
+                                    url = video_info.get("url") or video_info.get("player")
+                                    if url:
+                                        logger.info("[vk-media] Found video player URL: %s", url[:80])
+                        except Exception as e:
+                            logger.warning("[vk-media] Failed to call video.get API: %s", e)
                     
-                    # Fallback to 'url' field if present
-                    if not url:
-                        url = video_obj.get("url") or video_obj.get("player")
-                        if url:
-                            logger.info("[vk-media] Found video URL in 'url/player' field: %s", url[:80])
-                    
-                    # If we have a direct video URL, download it
+                    # Download video file if we have URL
                     if url:
                         try:
                             file_bytes = await self.download_file(url, timeout=120.0)
-                            files_bytes.append(file_bytes)
-                            title = video_obj.get("title", f"video_{video_obj.get('id', 'unknown')}")
-                            # Ensure filename has .mp4 extension
+                            title = video_obj.get("title", f"video_{video_id}")
                             if not title.endswith(".mp4"):
                                 title = f"{title}.mp4"
                             filenames.append(title)
-                            logger.info("[vk-media] Downloaded %d bytes as %s", len(file_bytes), title)
+                            files_bytes.append(file_bytes)
+                            logger.info("[vk-media] Downloaded video %d bytes as %s", len(file_bytes), title)
                         except Exception as e:
                             logger.warning("[vk-media] Failed to download video file: %s. Will use thumbnail instead.", e)
-                            # Fall through to thumbnail handling
                     
-                    # If no direct URL or download failed, try to get thumbnail image
-                    if not url or len(files_bytes) == 0 or filenames[-1] != f"video_{video_obj.get('id', 'unknown')}.mp4":
-                        # Get thumbnail from image array
+                    # If video download failed or no URL, use thumbnail
+                    if file_bytes is None:
                         images = video_obj.get("image", [])
                         if isinstance(images, list) and images:
-                            # Find the largest thumbnail (usually the last one with largest width)
+                            # Find the largest thumbnail
                             largest_img = max(images, key=lambda img: img.get("width", 0))
                             thumb_url = largest_img.get("url")
                             if thumb_url:
@@ -389,15 +400,15 @@ class VKMediaService:
                                 try:
                                     file_bytes = await self.download_file(thumb_url)
                                     files_bytes.append(file_bytes)
-                                    thumb_filename = f"video_{video_obj.get('id', 'unknown')}_thumbnail.jpg"
+                                    thumb_filename = f"video_{video_id}_thumbnail.jpg"
                                     filenames.append(thumb_filename)
                                     logger.info("[vk-media] Downloaded thumbnail %d bytes as %s", len(file_bytes), thumb_filename)
                                 except Exception as e:
                                     logger.warning("[vk-media] Failed to download video thumbnail: %s", e)
+                            else:
+                                logger.warning("[vk-media] No thumbnail URL found")
                         else:
                             logger.warning("[vk-media] No video URL or thumbnail available")
-                    else:
-                        logger.info("[vk-media] Video downloaded successfully")
                 
                 else:
                     logger.warning("[vk-media] Unknown attachment type: %s", att_type)
