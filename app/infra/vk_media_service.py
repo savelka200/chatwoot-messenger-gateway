@@ -279,16 +279,21 @@ class VKMediaService:
         
         logger.info("[vk-media] Processing %d attachments", len(attachments))
         
+        logger.info("[vk-media] Attachments raw data: %s", attachments)
+
         for att in attachments:
             att_type = att.get("type")
             logger.info("[vk-media] Processing attachment type: %s", att_type)
+            logger.info("[vk-media] Attachment object: %s", att)
             try:
                 if att_type == "photo":
                     photo_obj = att.get("photo", {})
                     logger.info("[vk-media] Photo object: id=%s sizes_count=%d", 
                                 photo_obj.get("id"), len(photo_obj.get("sizes", [])))
+                    logger.info("[vk-media] Photo object keys: %s", list(photo_obj.keys()))
                     # Get the largest size URL
                     sizes = photo_obj.get("sizes", [])
+                    logger.info("[vk-media] Photo sizes: %s", sizes)
                     if sizes:
                         # Sort by width to get largest
                         largest = max(sizes, key=lambda s: s.get("width", 0))
@@ -344,6 +349,7 @@ class VKMediaService:
                 logger.exception("[vk-media] Failed to process attachment %s: %s", att_type, e)
         
         logger.info("[vk-media] Successfully processed %d/%d attachments", len(files_bytes), len(attachments))
+        logger.info("[vk-media] Files bytes count: %d, Filenames count: %d", len(files_bytes), len(filenames))
         return files_bytes, filenames
 
     def build_attachment_string(self, media_type: str, owner_id: int, media_id: int) -> str:

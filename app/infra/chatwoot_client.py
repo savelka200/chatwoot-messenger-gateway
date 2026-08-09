@@ -219,6 +219,7 @@ class ChatwootClient:
         for idx, (filename, file_bytes, mime_type) in enumerate(files):
             logger.info("[chatwoot-client] Adding attachment %d: %s (%d bytes, %s)", 
                        idx, filename, len(file_bytes), mime_type)
+            logger.info("[chatwoot-client] Attachment %d first 100 bytes: %r", idx, file_bytes[:100])
             form_data.add_field(
                 "attachments[]",
                 file_bytes,
@@ -233,8 +234,16 @@ class ChatwootClient:
         }
         
         logger.info("[chatwoot-client] Sending multipart message to %s with %d files", url, len(files))
+        logger.info("[chatwoot-client] Content field: %r", content)
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(url, headers=headers, content=form_data)
-            logger.info("[chatwoot-client] Response status: %d, body: %s", r.status_code, r.text[:500])
+            logger.info("[chatwoot-client] Response status: %d", r.status_code)
+            logger.info("[chatwoot-client] Response headers: %s", dict(r.headers))
+            logger.info("[chatwoot-client] Response body (first 1000 chars): %s", r.text[:1000])
+            try:
+                response_json = r.json()
+                logger.info("[chatwoot-client] Response JSON: %s", response_json)
+            except Exception as json_err:
+                logger.warning("[chatwoot-client] Failed to parse JSON response: %s", json_err)
             r.raise_for_status()
             return r.json()

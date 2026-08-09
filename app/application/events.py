@@ -108,16 +108,24 @@ async def _process_vk_attachments_and_send_to_chatwoot(
         # Send message with attachments to Chatwoot
         if files:
             logger.info("[events-vk] Sending %d attachments to Chatwoot conv_id=%s", len(files), conv_id)
-            await cw._client.send_message_with_attachments(
-                conversation_id=conv_id,
-                content=text if text else None,
-                files=files,
-                message_type="incoming",
-            )
-            logger.info(
-                "[events] vk -> chatwoot OK conv_id=%s inbox=%s with %d attachments",
-                conv_id, inbox_id, len(files)
-            )
+            for i, (fname, fbytes, fmime) in enumerate(files):
+                logger.info("[events-vk] File %d details: name=%s size=%d mime=%s first_bytes=%r", 
+                           i, fname, len(fbytes), fmime, fbytes[:50])
+            try:
+                result = await cw._client.send_message_with_attachments(
+                    conversation_id=conv_id,
+                    content=text if text else None,
+                    files=files,
+                    message_type="incoming",
+                )
+                logger.info("[events-vk] Chatwoot API response: %s", result)
+                logger.info(
+                    "[events] vk -> chatwoot OK conv_id=%s inbox=%s with %d attachments",
+                    conv_id, inbox_id, len(files)
+                )
+            except Exception as e:
+                logger.exception("[events-vk] send_message_with_attachments failed: %s", e)
+                raise
         else:
             # Fallback to text-only if no files processed
             logger.warning("[events-vk] No files to send, falling back to text-only")
