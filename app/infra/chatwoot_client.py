@@ -203,28 +203,30 @@ class ChatwootClient:
         """
         url = f"{self._account_base}/conversations/{conversation_id}/messages"
         
-        # Build multipart form data
-        form_data = httpx.FormData()
+        # Build multipart form data using httpx.Files type
+        # httpx expects files as a dict or list of tuples
+        form_data: Dict[str, Any] = {}
         if content:
-            form_data.add_field("content", content)
+            form_data["content"] = content
         else:
-            form_data.add_field("content", "")
+            form_data["content"] = ""
         
         # Add message_type if provided
         message_type = extra_fields.get("message_type")
         if message_type:
-            form_data.add_field("message_type", message_type)
+            form_data["message_type"] = message_type
         
-        # Add attachments[] field for each file - Chatwoot expects this exact field name
+        # Build files list for httpx - multiple files with same field name require list of tuples
+        import io
+        files_list: List[Tuple[str, Any]] = []
         for idx, (filename, file_bytes, mime_type) in enumerate(files):
             logger.info("[chatwoot-client] Adding attachment %d: %s (%d bytes, %s)", 
                        idx, filename, len(file_bytes), mime_type)
-            form_data.add_field(
-                "attachments[]",
-                file_bytes,
-                filename=filename,
-                content_type=mime_type
-            )
+            logger.info("[chatwoot-client] Attachment %d first 100 bytes: %r", idx, file_bytes[:100])
+            # Use BytesIO wrapper for better compatibility
+            file_obj = io.BytesIO(file_bytes)
+            # For multiple files with same field name, httpx expects list of tuples
+            files_list.append((f"attachments[]", (filename, file_obj, mime_type)))
         
         # Custom headers without Content-Type (httpx will set it with boundary)
         headers = {
@@ -233,8 +235,19 @@ class ChatwootClient:
         }
         
         logger.info("[chatwoot-client] Sending multipart message to %s with %d files", url, len(files))
+        logger.info("[chatwoot-client] Content field: %r", content)
+        logger.info("[chatwoot-client] Form data fields: %s", list(form_data.keys()))
+        logger.info("[chatwoot-client] Files to upload: %d", len(files_list))
+        
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(url, headers=headers, content=form_data)
-            logger.info("[chatwoot-client] Response status: %d, body: %s", r.status_code, r.text[:500])
+            r = await client.post(url, headers=headers, data=form_data, files=files_list)
+            logger.info("[chatwoot-client] Response status: %d", r.status_code)
+            logger.info("[chatwoot-client] Response headers: %s", dict(r.headers))
+            logger.info("[chatwoot-client] Response body (first 1000 chars): %s", r.text[:1000])
+            try:
+                response_json = r.json()
+                logger.info("[chatwoot-client] Response JSON: %s", response_json)
+            except Exception as json_err:
+                logger.warning("[chatwoot-client] Failed to parse JSON response: %s", json_err)
             r.raise_for_status()
             return r.json()

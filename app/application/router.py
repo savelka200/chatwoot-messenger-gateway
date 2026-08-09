@@ -140,7 +140,14 @@ class MessageRouter:
         recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
 
         # Check for attachments in the payload
+        # Chatwoot sends attachments in the message object, not at root level
         attachments = _dig(payload, "attachments", default=[])
+        if not attachments:
+            # Also try to get attachments from the message content if present
+            attachments = _dig(payload, "message", "attachments", default=[])
+        if not attachments:
+            # Try content_attributes as fallback
+            attachments = _dig(payload, "content_attributes", "attachments", default=[])
         
         if not channel or not recipient_id:
             logger.warning(
@@ -213,7 +220,7 @@ class MessageRouter:
                     logger.warning("[router] Attachment missing URL: %s", att)
                     continue
                 
-                logger.info("[router] Processing attachment: url=%s file_type=%s", file_url, att.get("file_type"))
+                logger.info("[router] Processing attachment: url=%s file_type=%s", file_url[:100] if len(file_url) > 100 else file_url, att.get("file_type"))
                 
                 # Determine media type from Chatwoot's file_type or content_type
                 file_type = att.get("file_type", "")
@@ -239,18 +246,17 @@ class MessageRouter:
                     mime_type=content_type or None,
                 )
                 
-                logger.info("[router] Created MediaContent: media_type=%s url=%s caption=%s filename=%s",
-                           media_type, file_url[:80] if file_url else None, 
+                logger.info("[router] Created MediaContent: media_type=%s url_len=%d caption=%s filename=%s",
+                           media_type, len(file_url), 
                            text[:50] if text else None, filename)
                 
                 await adapter.send_media(recipient_id, content)
                 logger.info(
-                    "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s url=%s",
+                    "[router] OUTBOUND MEDIA: channel=%s recipient_id=%s file=%s type=%s",
                     channel,
                     recipient_id,
                     filename,
                     media_type,
-                    file_url,
                 )
             except Exception as e:
                 logger.exception("[router] Failed to send attachment: %s", e)

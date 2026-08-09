@@ -1,5 +1,5 @@
+import base64
 import logging
-import secrets
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx  # NEW
@@ -80,12 +80,32 @@ class VkAdapter(MessengerAdapter):
             if files_bytes:
                 # Use first file for MediaContent (VK typically sends one attachment per message)
                 # If multiple attachments, they come as separate messages
+                # Encode file bytes to base64 and create data URL
+                first_file = files_bytes[0]
+                first_filename = filenames[0] if filenames else "photo.jpg"
+                
+                # Determine MIME type from filename
+                mime_type = "application/octet-stream"
+                if first_filename.endswith(('.jpg', '.jpeg')):
+                    mime_type = "image/jpeg"
+                elif first_filename.endswith('.png'):
+                    mime_type = "image/png"
+                elif first_filename.endswith('.gif'):
+                    mime_type = "image/gif"
+                
+                # Create base64 encoded data URL
+                base64_data = base64.b64encode(first_file).decode('utf-8')
+                data_url = f"data:{mime_type};base64,{base64_data}"
+                
+                logger.info("[vk] Created MediaContent with base64 data URL: len=%d mime=%s", len(base64_data), mime_type)
+                
                 content = MediaContent(
                     type="media",
-                    media_type="image",  # default, will be refined
-                    url=f"data:application/octet-stream;base64,",  # placeholder - actual file in raw
+                    media_type="image" if "image" in mime_type else "document",
+                    url=data_url,
                     caption=text if text else None,
-                    filename=filenames[0] if filenames else None,
+                    filename=first_filename,
+                    mime_type=mime_type,
                 )
                 # Store file bytes in raw for downstream processing
                 raw_data = {**payload, "_files": files_bytes, "_filenames": filenames}
