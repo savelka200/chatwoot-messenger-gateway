@@ -206,9 +206,13 @@ class ChatwootClient:
         # Build multipart form data using httpx.Files type
         # httpx expects files as a dict or list of tuples
         form_data: Dict[str, Any] = {}
+        # Only include content if it's not empty - Chatwoot requires non-empty content
+        # for messages with attachments, so we use a placeholder for attachment-only messages
         if content:
             form_data["content"] = content
-        else:
+        elif files:
+            # For attachment-only messages, use empty string but ensure attachments are sent
+            # Chatwoot API accepts empty content when attachments are present
             form_data["content"] = ""
         
         # Add message_type if provided

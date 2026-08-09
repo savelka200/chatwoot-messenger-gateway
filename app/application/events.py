@@ -237,6 +237,13 @@ def wire_events(
             peer_id = str(message.get("peer_id") or "")
             from_id = str(message.get("from_id") or peer_id)
 
+            # Get attachments from the raw message object
+            attachments = message.get("attachments", [])
+
+            inbox_id = getattr(adapters.get("vk"), "inbox_id", None)
+            if not inbox_id:
+                raise RuntimeError("VK inbox_id is not configured")
+
             # Enrich with profile
             vk_name: Optional[str] = None
             vk_bdate: Optional[str] = None
@@ -270,61 +277,67 @@ def wire_events(
                 elif screen_name:
                     vk_name = screen_name
 
-            inbox_id = getattr(adapters.get("vk"), "inbox_id", None)
-            if not inbox_id:
-                raise RuntimeError("VK inbox_id is not configured")
-
             custom_attributes = {"vk_user_id": from_id, "vk_peer_id": peer_id}
             if vk_bdate:
                 custom_attributes["vk_bdate"] = vk_bdate
 
-            # Check for attachments (processed by VkAdapter and stored in payload)
-            files_bytes = payload.get("_files", [])
-            filenames = payload.get("_filenames", [])
+            # Process attachments if present
+            if attachments:
+                logger.info("[events] Processing VK message with %d attachments", len(attachments))
+                # Use VK media service to download attachments
+                vk_adapter = adapters.get("vk")
+                media_service = getattr(vk_adapter, "_media_service", None) if vk_adapter else None
+                
+                if media_service:
+                    try:
+                        files_bytes, filenames = await media_service.process_incoming_attachments(attachments)
+                        if files_bytes and filenames:
+                            await _process_vk_attachments_and_send_to_chatwoot(
+                                cw=cw,
+                                inbox_id=inbox_id,
+                                peer_id=peer_id,
+                                from_id=from_id,
+                                text=text,
+                                files_bytes=files_bytes,
+                                filenames=filenames,
+                                vk_name=vk_name,
+                                custom_attributes=custom_attributes,
+                                additional_attributes=additional_attributes,
+                                avatar_url=avatar_url,
+                            )
+                            return
+                        else:
+                            logger.warning("[events] No files downloaded from attachments, falling back to text-only")
+                    except Exception as e:
+                        logger.exception("[events] Failed to process attachments: %s", e)
+                        # Fallback to text-only on error
 
-            if files_bytes and filenames:
-                # Handle message with attachments
-                logger.info("[events] Processing VK message with %d attachments", len(files_bytes))
-                await _process_vk_attachments_and_send_to_chatwoot(
-                    cw=cw,
-                    inbox_id=inbox_id,
-                    peer_id=peer_id,
-                    from_id=from_id,
-                    text=text,
-                    files_bytes=files_bytes,
-                    filenames=filenames,
-                    vk_name=vk_name,
-                    custom_attributes=custom_attributes,
-                    additional_attributes=additional_attributes,
-                    avatar_url=avatar_url,
-                )
-            else:
-                # Handle text-only message
-                logger.info("[events] Processing VK text-only message: %s", text[:50] if text else "(empty)")
-                ensured = await cw.ensure_contact(
-                    inbox_id=inbox_id,
-                    search_key=from_id,
-                    name=vk_name or from_id,
-                    phone=None,
-                    email=None,
-                    custom_attributes=custom_attributes,
-                    additional_attributes=additional_attributes,
-                    avatar_url=avatar_url,
-                )
+            # Handle text-only message
+            logger.info("[events] Processing VK text-only message: %s", text[:50] if text else "(empty)")
+            ensured = await cw.ensure_contact(
+                inbox_id=inbox_id,
+                search_key=from_id,
+                name=vk_name or from_id,
+                phone=None,
+                email=None,
+                custom_attributes=custom_attributes,
+                additional_attributes=additional_attributes,
+                avatar_url=avatar_url,
+            )
 
-                conv_id = await cw.ensure_conversation(
-                    inbox_id=inbox_id,
-                    contact_id=ensured["id"],
-                    source_id=ensured["source_id"],
-                )
-                await cw.create_message(
-                    conversation_id=conv_id,
-                    content=text,
-                    direction="incoming",
-                )
-                logger.info(
-                    "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
-                )
+            conv_id = await cw.ensure_conversation(
+                inbox_id=inbox_id,
+                contact_id=ensured["id"],
+                source_id=ensured["source_id"],
+            )
+            await cw.create_message(
+                conversation_id=conv_id,
+                content=text,
+                direction="incoming",
+            )
+            logger.info(
+                "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
+            )
         except Exception as e:
             logger.exception("[events] vk handling failed: %s", e)
 
