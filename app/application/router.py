@@ -140,7 +140,14 @@ class MessageRouter:
         recipient_id = self._derive_recipient_id(channel=channel, payload=payload)
 
         # Check for attachments in the payload
+        # Chatwoot sends attachments in the message object, not at root level
         attachments = _dig(payload, "attachments", default=[])
+        if not attachments:
+            # Also try to get attachments from the message content if present
+            attachments = _dig(payload, "message", "attachments", default=[])
+        if not attachments:
+            # Try content_attributes as fallback
+            attachments = _dig(payload, "content_attributes", "attachments", default=[])
         
         if not channel or not recipient_id:
             logger.warning(
