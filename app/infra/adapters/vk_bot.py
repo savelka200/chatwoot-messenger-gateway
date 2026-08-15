@@ -570,9 +570,19 @@ class VkAdapter(MessengerAdapter):
                     failed_attachments.append(f"🎵 {media.filename} (аудио пока не поддерживается)")
     
                 elif media.media_type == "video":
-                    logger.warning("[vk] video not yet supported for outgoing, skipped: %s", media.filename)
-                    failed_attachments.append(f"🎬 {media.filename} (видео пока не поддерживается)")
-    
+                    filename = media.filename or "video.mp4"
+                    logger.info(
+                        "[vk] uploading video as document: %s (%d bytes)",
+                        filename, len(file_bytes),
+                    )
+                    att = await self.send_document(
+                        peer_id,
+                        file_bytes,
+                        filename,
+                        doc_type="doc",  # загружаем как обычный документ
+                    )
+                    attachment_strings.append(att)
+
                 else:
                     logger.warning("[vk] unknown media_type=%s, skipped: %s", media.media_type, media.filename)
                     failed_attachments.append(f"📎 {media.filename} (неизвестный тип)")
