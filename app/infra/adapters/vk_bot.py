@@ -25,6 +25,53 @@ class VkAdapter(MessengerAdapter):
         self._http: Optional[httpx.AsyncClient] = None  # NEW
 
 
+    async def _download_file(self, url: str) -> bytes:
+        """Скачивает файл по URL."""
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.content
+
+    async def send_photo(self, peer_id: int, photo_bytes: bytes, filename: str = "photo.jpg") -> str:
+        """
+        Загружает фото в ВК и возвращает строку 'photo<owner_id>_<photo_id>'.
+        Используется для параметра attachment в messages.send.
+        """
+        if not self._http:
+            raise RuntimeError("VK HTTP client is not initialized")
+
+        # Шаг 1: Получить URL сервера загрузки
+        upload_server = await self._vk_call(
+            "photos.getMessagesUploadServer", {"peer_id": peer_id}
+        )
+        upload_url = upload_server.get("upload_url")
+        if not upload_url:
+            raise RuntimeError("No upload_url in photos.getMessagesUploadServer response")
+
+        # Шаг 2: Загрузить файл на сервер ВК (абсолютный URL, не через _vk_call)
+        async with httpx.AsyncClient(timeout=60.0) as upload_client:
+            files = {"photo": (filename, photo_bytes, "image/jpeg")}
+            resp = await upload_client.post(upload_url, files=files)
+            resp.raise_for_status()
+            upload_result = resp.json()  # {"server": N, "photo": "[...]", "hash": "..."}
+
+        # Шаг 3: Сохранить фото
+        saved = await self._vk_call("photos.saveMessagesPhoto", upload_result)
+        if not saved:
+            raise RuntimeError("Empty response from photos.saveMessagesPhoto")
+
+        # API возвращает массив из одного элемента
+        photo = saved[0] if isinstance(saved, list) else saved
+        owner_id = photo["owner_id"]
+        photo_id = photo["id"]
+        access_key = photo.get("access_key")
+
+        att = f"photo{owner_id}_{photo_id}"
+        if access_key:
+            att += f"_{access_key}"
+        logger.info("[vk] photo uploaded: %s", att)
+        return att
+
     @staticmethod
     def format_reply_quote(reply_msg: Dict[str, Any]) -> str:
         """
@@ -397,3 +444,68 @@ class VkAdapter(MessengerAdapter):
             logger.info("[vk] SENT: peer_id=%s message_id=%s", recipient_id, res)
         except Exception as e:
             logger.exception("[vk] Failed to send text to %s: %s", recipient_id, e)
+
+    async def send_message(
+        self,
+        recipient_id: str,
+        text: str,
+        attachments: List[MediaContent],
+        reply_to_message_id: Optional[str] = None,
+    ) -> None:
+        """
+        Универсальная отправка сообщения: текст + любые вложения + reply.
+        """
+        peer_id = int(recipient_id)
+        attachment_strings: List[str] = []
+    
+        # Загружаем каждое вложение
+        for media in attachments:
+            try:
+                file_bytes = await self._download_file(str(media.url))
+    
+                if media.media_type == "image":
+                    att = await self.send_photo(
+                        peer_id,
+                        file_bytes,
+                        media.filename or "photo.jpg",
+                    )
+                    attachment_strings.append(att)
+                else:
+                    # На первом этапе: всё кроме фото пропускаем с предупреждением
+                    # (документы/видео/голосовые реализуем следующим шагом)
+                    logger.warning(
+                        "[vk] media_type=%s not supported for outgoing yet, skipped: %s",
+                        media.media_type, media.filename,
+                    )
+            except Exception as e:
+                logger.error(
+                    "[vk] failed to upload attachment %s: %s",
+                    media.url, e,
+                )
+                # Продолжаем — отправим хотя бы текст и остальные вложения
+    
+        # Формируем параметры messages.send
+        params: Dict[str, Any] = {
+            "peer_id": peer_id,
+            "random_id": secrets.randbits(31),
+        }
+        if text:
+            params["message"] = text
+        if attachment_strings:
+            params["attachment"] = ",".join(attachment_strings)
+        if reply_to_message_id:
+            params["reply_to"] = int(reply_to_message_id)
+    
+        # Проверяем, что есть что отправлять
+        if not text and not attachment_strings:
+            logger.warning("[vk] nothing to send (empty text, no attachments uploaded)")
+            return
+    
+        try:
+            res = await self._vk_call("messages.send", params)
+            logger.info(
+                "[vk] SENT: peer_id=%s text=%r attachments=%d reply=%s result=%s",
+                peer_id, (text or "")[:50], len(attachment_strings), reply_to_message_id, res,
+            )
+        except Exception as e:
+            logger.exception("[vk] Failed to send message to %s: %s", peer_id, e)
