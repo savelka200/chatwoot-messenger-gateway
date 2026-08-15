@@ -133,20 +133,19 @@ def wire_events(
             photo_files: List[Tuple[str, bytes, str]] = []
             video_titles: List[str] = []  # собираем заголовки видео для комментария
             doc_mentions: List[str] = []
+            voice_mentions: List[str] = []
 
             for idx, media in enumerate(umsg.attachments):
-                # === Регистрация видео для текстового комментария ===
+                # Регистрация для текстовых комментариев
                 if media.media_type == "video":
                     title = (media.caption or "без названия").strip()
-                    video_titles.append(title)
+                    video_titles.append(title)          
 
                 # === Скачивание ===
                 try:
-                    # Для документов проверяем размер
                     if media.media_type == "document":
                         size = (media.raw or {}).get("size")
                         if size and size > MAX_DOC_SIZE_BYTES:
-                            # Слишком большой — отправим только ссылку в тексте
                             doc_mentions.append(
                                 f"📎 {media.caption} ({_format_size(size)}): {media.url}"
                             )
@@ -154,59 +153,65 @@ def wire_events(
                                 "[vk] doc too large (%s bytes), sending link only: %s",
                                 size, media.caption,
                             )
-                            continue
-                        
+                            continue            
+
                     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
                         mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
-                    photo_files.append((media.filename or f"vk_media_{idx}", resp.content, mime))
+                    photo_files.append((media.filename or f"vk_media_{idx}", resp.content, mime))           
 
                 except httpx.HTTPStatusError as e:
                     status = e.response.status_code
                     if media.media_type == "video":
-                        logger.info(
-                            "[vk] video preview not available (status=%s): %s",
-                            status, media.caption,
-                        )
+                        logger.info("[vk] video preview not available (status=%s): %s", status, media.caption)
                     elif media.media_type == "document":
-                        # Не удалось скачать — отправим ссылку в тексте
                         doc_mentions.append(f"📎 {media.caption}: {media.url}")
-                        logger.warning(
-                            "[vk] doc download failed (status=%s), sending link: %s",
-                            status, media.caption,
-                        )
+                        logger.warning("[vk] doc download failed (status=%s), sending link: %s", status, media.caption)
+                    elif media.media_type == "audio":
+                        duration = (media.raw or {}).get("duration", 0)
+                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
+                        logger.warning("[vk] voice message download failed (status=%s), sending text mention", status)
                     else:
                         logger.warning("[vk] media download failed (%s): %s", media.url, e)
                 except Exception as e:
                     if media.media_type == "document":
                         doc_mentions.append(f"📎 {media.caption}: {media.url}")
                         logger.warning("[vk] doc download failed, sending link: %s — %s", media.caption, e)
+                    elif media.media_type == "audio":
+                        duration = (media.raw or {}).get("duration", 0)
+                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
+                        logger.warning("[vk] voice message download failed: %s", e)
                     else:
-                        logger.warning("[vk] media download failed (%s): %s", media.url, e)
+                        logger.warning("[vk] media download failed (%s): %s", media.url, e)         
 
             # Собираем основной текст сообщения
             text = ""
             if isinstance(umsg.content, TextContent):
                 text = umsg.content.text.strip()
             elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
-                text = umsg.content.caption.strip()
+                text = umsg.content.caption.strip()         
 
-            if not text and photo_files and not video_titles and not doc_mentions:
-                text = ""
+            if not text and photo_files and not video_titles and not doc_mentions and not voice_mentions:
+                text = "Вложения"           
 
-            # Комментарий для видео
-            comment_blocks: List[str] = []
+            # Формируем блоки комментариев
+            comment_blocks: List[str] = []          
+
             if video_titles:
                 video_block = "🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
                 video_block += "\n".join(f"  • {title}" for title in video_titles)
-                comment_blocks.append(video_block)
+                comment_blocks.append(video_block)          
 
-            # Комментарий для документов (не удалось скачать или слишком большие)
             if doc_mentions:
                 doc_block = "📎 Документы (ссылки):\n"
                 doc_block += "\n".join(f"  {m}" for m in doc_mentions)
-                comment_blocks.append(doc_block)
+                comment_blocks.append(doc_block)            
+
+            if voice_mentions:
+                voice_block = "🎤 Голосовые сообщения (не удалось скачать):\n"
+                voice_block += "\n".join(f"  {m}" for m in voice_mentions)
+                comment_blocks.append(voice_block)          
 
             if comment_blocks:
                 text = text + "\n\n" + "\n\n".join(comment_blocks) if text else "\n\n".join(comment_blocks)

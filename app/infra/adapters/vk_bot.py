@@ -26,6 +26,54 @@ class VkAdapter(MessengerAdapter):
 
 
     @staticmethod
+    def format_reply_quote(reply_msg: Dict[str, Any]) -> str:
+        """
+        Формирует текстовую цитату из reply_message.
+        Возвращает строку вида:
+          ↩️ Ответ на сообщение:
+          "Текст оригинала"
+          📎 2 документа
+        """
+        if not reply_msg:
+            return ""
+
+        text = (reply_msg.get("text") or "").strip()
+        attachments = reply_msg.get("attachments") or []
+
+        # Подсчитываем типы вложений
+        attachment_counts: Dict[str, int] = {}
+        for att in attachments:
+            att_type = att.get("type", "unknown")
+            attachment_counts[att_type] = attachment_counts.get(att_type, 0) + 1
+
+        # Формируем описание вложений
+        attachment_descriptions = []
+        type_names = {
+            "photo": "фото",
+            "video": "видео",
+            "doc": "документ",
+            "audio_message": "голосовое",
+            "audio": "аудио",
+        }
+        for att_type, count in attachment_counts.items():
+            name = type_names.get(att_type, att_type)
+            # Склонение для русского языка
+            if count == 1:
+                attachment_descriptions.append(f"📎 {count} {name}")
+            elif 2 <= count <= 4:
+                attachment_descriptions.append(f"📎 {count} {name}а")
+            else:
+                attachment_descriptions.append(f"📎 {count} {name}ов")
+
+        # Собираем цитату
+        quote_lines = ["↩️ Ответ на сообщение:"]
+        if text:
+            quote_lines.append(f'"{text}"')
+        if attachment_descriptions:
+            quote_lines.extend(attachment_descriptions)
+
+        return "\n".join(quote_lines)
+    @staticmethod
     def extract_vk_photo_url(photo: Dict[str, Any]) -> Optional[str]:
         #orig_photo → самый крупный size
         orig_url = (photo.get("orig_photo") or {}).get("url")
@@ -37,21 +85,21 @@ class VkAdapter(MessengerAdapter):
         best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
         return best.get("url")
 
+
     @classmethod
     def parse_vk_media(
         cls, msg: Dict[str, Any]
     ) -> Tuple[Union[TextContent, MediaContent], List[MediaContent]]:
         """
         Разбирает message из Callback API.
-        Поддерживает: фото (любое количество), видео (превью), документы.
-        Возвращает: (основной content, список всех медиа-вложений).
+        Поддерживает: фото, видео (превью), документы, голосовые сообщения.
         """
         text = (msg.get("text") or "").strip()
-        message_id = str(msg.get("id")) if msg.get("id") is not None else "msg"
+        message_id = str(msg.get("id")) if msg.get("id") is not None else "msg" 
 
         attachments: List[MediaContent] = []
         for idx, att in enumerate(msg.get("attachments") or []):
-            att_type = att.get("type")
+            att_type = att.get("type")  
 
             if att_type == "photo":
                 photo = att.get("photo") or {}
@@ -68,7 +116,7 @@ class VkAdapter(MessengerAdapter):
                         filename=f"vk_{message_id}_{idx}.jpg",
                         mime_type="image/jpeg",
                     )
-                )
+                )   
 
             elif att_type == "video":
                 video = att.get("video") or {}
@@ -92,52 +140,62 @@ class VkAdapter(MessengerAdapter):
                         filename=f"vk_{message_id}_{idx}_video_preview.jpg",
                         mime_type="image/jpeg",
                     )
-                )
+                )   
 
             elif att_type == "doc":
                 doc = att.get("doc") or {}
                 doc_url = doc.get("url")
                 if not doc_url:
                     continue
-                # Имя файла из title (уже с расширением)
                 title = (doc.get("title") or "").strip()
                 ext = (doc.get("ext") or "").strip()
                 if not title and ext:
                     title = f"vk_document.{ext}"
                 if not title:
                     title = "vk_document.bin"
-                # Убеждаемся, что в имени есть расширение
                 if ext and not title.lower().endswith(f".{ext.lower()}"):
                     title = f"{title}.{ext}"
-
-                # MIME определяем по расширению
                 guessed, _ = mimetypes.guess_type(title)
                 mime_type = guessed or "application/octet-stream"
-
-                # Размер в байтах — положим в raw для использования в events.py
                 size = doc.get("size")
-
                 attachments.append(
                     MediaContent(
                         type="media",
                         media_type="document",
                         url=doc_url,
-                        caption=title,              # здесь храним имя файла
+                        caption=title,
                         filename=title,
                         mime_type=mime_type,
+                        raw={"size": size} if size else {},
                     )
-                )
-                # Сохраняем размер в raw — поле не используется Pydantic напрямую,
-                # но мы его прочтём через raw, если нужно
-                attachments[-1].raw = {"size": size} if size else {}
+                )   
 
-        # Логика основного контента
+            elif att_type == "audio_message":
+                audio_msg = att.get("audio_message") or {}
+                # Используем MP3 как более универсальный формат
+                audio_url = audio_msg.get("link_mp3") or audio_msg.get("link_ogg")
+                if not audio_url:
+                    continue
+                duration = audio_msg.get("duration") or 0
+                # Формируем имя файла с указанием длительности
+                filename = f"vk_{message_id}_{idx}_voice_{duration}s.mp3"
+                attachments.append(
+                    MediaContent(
+                        type="media",
+                        media_type="audio",
+                        url=audio_url,
+                        caption=f"Голосовое сообщение ({duration} сек)",
+                        filename=filename,
+                        mime_type="audio/mpeg" if audio_url.endswith(".mp3") else "audio/ogg",
+                        raw={"duration": duration},
+                    )
+                )   
+
         if not attachments:
-            return TextContent(type="text", text=text), []
+            return TextContent(type="text", text=text), []  
 
         primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
         return primary, attachments
-
     @classmethod
     def _build_content(cls, msg, *_args):
         return cls.parse_vk_media(msg)
@@ -198,7 +256,24 @@ class VkAdapter(MessengerAdapter):
             message_id = str(msg.get("id")) if msg.get("id") is not None else None
         
             content, attachments = self._build_content(msg)
-        
+
+            reply_msg = msg.get("reply_message")
+            if reply_msg:
+                reply_quote = self.format_reply_quote(reply_msg)
+                logger.info("[vk] reply detected, adding quote to message")
+
+                # Добавляем цитату к основному тексту
+                if isinstance(content, TextContent):
+                    # Если основной контент — текст, добавляем цитату в начало
+                    original_text = content.text.strip()
+                    new_text = f"{reply_quote}\n\n{original_text}" if original_text else reply_quote
+                    content = TextContent(type="text", text=new_text)
+                elif isinstance(content, MediaContent):
+                    # Если основной контент — медиа (одно фото без текста),
+                    # превращаем его в TextContent с цитатой, а медиа уйдёт в attachments
+                    attachments.insert(0, content)  # медиа становится первым вложением
+                    content = TextContent(type="text", text=reply_quote)
+
             umsg = UnifiedMessage(
                 channel="vk",
                 sender_id=from_id,
