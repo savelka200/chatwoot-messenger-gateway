@@ -1,7 +1,7 @@
 import logging
 import secrets
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union, List
-
+import mimetypes
 import httpx  # NEW
 from pyee.asyncio import AsyncIOEventEmitter
 
@@ -43,7 +43,7 @@ class VkAdapter(MessengerAdapter):
     ) -> Tuple[Union[TextContent, MediaContent], List[MediaContent]]:
         """
         Разбирает message из Callback API.
-        Поддерживает фото (любое количество) и видео (превью).
+        Поддерживает: фото (любое количество), видео (превью), документы.
         Возвращает: (основной content, список всех медиа-вложений).
         """
         text = (msg.get("text") or "").strip()
@@ -72,7 +72,6 @@ class VkAdapter(MessengerAdapter):
 
             elif att_type == "video":
                 video = att.get("video") or {}
-                # Берём самое большое превью из массива image
                 previews = video.get("image") or []
                 if not previews:
                     continue
@@ -83,25 +82,61 @@ class VkAdapter(MessengerAdapter):
                 preview_url = best_preview.get("url")
                 if not preview_url:
                     continue
-
                 title = (video.get("title") or "").strip() or None
                 attachments.append(
                     MediaContent(
                         type="media",
                         media_type="video",
-                        url=preview_url,          # URL превью (картинка)
-                        caption=title,            # Заголовок видео
+                        url=preview_url,
+                        caption=title,
                         filename=f"vk_{message_id}_{idx}_video_preview.jpg",
-                        mime_type="image/jpeg",   # Превью — JPEG
+                        mime_type="image/jpeg",
                     )
                 )
+
+            elif att_type == "doc":
+                doc = att.get("doc") or {}
+                doc_url = doc.get("url")
+                if not doc_url:
+                    continue
+                # Имя файла из title (уже с расширением)
+                title = (doc.get("title") or "").strip()
+                ext = (doc.get("ext") or "").strip()
+                if not title and ext:
+                    title = f"vk_document.{ext}"
+                if not title:
+                    title = "vk_document.bin"
+                # Убеждаемся, что в имени есть расширение
+                if ext and not title.lower().endswith(f".{ext.lower()}"):
+                    title = f"{title}.{ext}"
+
+                # MIME определяем по расширению
+                guessed, _ = mimetypes.guess_type(title)
+                mime_type = guessed or "application/octet-stream"
+
+                # Размер в байтах — положим в raw для использования в events.py
+                size = doc.get("size")
+
+                attachments.append(
+                    MediaContent(
+                        type="media",
+                        media_type="document",
+                        url=doc_url,
+                        caption=title,              # здесь храним имя файла
+                        filename=title,
+                        mime_type=mime_type,
+                    )
+                )
+                # Сохраняем размер в raw — поле не используется Pydantic напрямую,
+                # но мы его прочтём через raw, если нужно
+                attachments[-1].raw = {"size": size} if size else {}
+
+        # Логика основного контента
         if not attachments:
             return TextContent(type="text", text=text), []
-            # Текст становится content, все фото — вложениями
-        primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
-        media_list = attachments
 
-        return primary, media_list
+        primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
+        return primary, attachments
 
     @classmethod
     def _build_content(cls, msg, *_args):

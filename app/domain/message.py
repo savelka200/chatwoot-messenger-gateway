@@ -16,6 +16,7 @@ class MediaContent(BaseModel):
     caption: str | None = None
     filename: str | None = None
     mime_type: str | None = None
+    raw: Dict[str, Any] = {}
 
 
 class StickerContent(BaseModel):

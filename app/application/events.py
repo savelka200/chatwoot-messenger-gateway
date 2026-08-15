@@ -12,6 +12,15 @@ from app.domain.message import UnifiedMessage, TextContent, MediaContent
 
 
 logger = logging.getLogger(__name__)
+MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
+
+def _format_size(size_bytes: int) -> str:
+    """Человекочитаемый размер файла."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if size_bytes < 1024 or unit == "GB":
+            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} GB"
 
 
 async def _fetch_vk_profile(
@@ -123,55 +132,84 @@ def wire_events(
             # Скачиваем все медиа (фото и видео-превью — оба приходят как картинки по MIME)
             photo_files: List[Tuple[str, bytes, str]] = []
             video_titles: List[str] = []  # собираем заголовки видео для комментария
+            doc_mentions: List[str] = []
 
             for idx, media in enumerate(umsg.attachments):
-                # === СНАЧАЛА регистрируем видео для текстового комментария ===
-                # Это делается до попытки скачивания, чтобы комментарий появился
-                # даже если превью недоступно (404, CDN недоступен и т.д.)
+                # === Регистрация видео для текстового комментария ===
                 if media.media_type == "video":
                     title = (media.caption or "без названия").strip()
                     video_titles.append(title)
 
-                # === Теперь пытаемся скачать превью/фото ===
+                # === Скачивание ===
                 try:
-                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as dl:
+                    # Для документов проверяем размер
+                    if media.media_type == "document":
+                        size = (media.raw or {}).get("size")
+                        if size and size > MAX_DOC_SIZE_BYTES:
+                            # Слишком большой — отправим только ссылку в тексте
+                            doc_mentions.append(
+                                f"📎 {media.caption} ({_format_size(size)}): {media.url}"
+                            )
+                            logger.info(
+                                "[vk] doc too large (%s bytes), sending link only: %s",
+                                size, media.caption,
+                            )
+                            continue
+                        
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
-                        mime = (resp.headers.get("content-type") or media.mime_type or "image/jpeg").split(";")[0]
-                    photo_files.append((media.filename or f"vk_media_{idx}.jpg", resp.content, mime))
+                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
+                    photo_files.append((media.filename or f"vk_media_{idx}", resp.content, mime))
 
                 except httpx.HTTPStatusError as e:
-                    # Разные уровни логирования для видео и фото
+                    status = e.response.status_code
                     if media.media_type == "video":
-                        # 404 для превью видео — ожидаемое поведение (ВК часто инвалидирует CDN-ссылки)
                         logger.info(
-                            "[vk] video preview not available (status=%s), "
-                            "will send text-only mention: %s",
-                            e.response.status_code, media.caption,
+                            "[vk] video preview not available (status=%s): %s",
+                            status, media.caption,
+                        )
+                    elif media.media_type == "document":
+                        # Не удалось скачать — отправим ссылку в тексте
+                        doc_mentions.append(f"📎 {media.caption}: {media.url}")
+                        logger.warning(
+                            "[vk] doc download failed (status=%s), sending link: %s",
+                            status, media.caption,
                         )
                     else:
-                        logger.warning(
-                            "[vk] media download failed (%s): %s", media.url, e,
-                        )
+                        logger.warning("[vk] media download failed (%s): %s", media.url, e)
                 except Exception as e:
-                    logger.warning("[vk] media download failed (%s): %s", media.url, e)
+                    if media.media_type == "document":
+                        doc_mentions.append(f"📎 {media.caption}: {media.url}")
+                        logger.warning("[vk] doc download failed, sending link: %s — %s", media.caption, e)
+                    else:
+                        logger.warning("[vk] media download failed (%s): %s", media.url, e)
 
-            # Собираем основной текст сообщения (как было)
+            # Собираем основной текст сообщения
             text = ""
             if isinstance(umsg.content, TextContent):
                 text = umsg.content.text.strip()
             elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
                 text = umsg.content.caption.strip()
 
-            # Fallback для пустого текста — только если нет и фото, и видео
-            if not text and photo_files and not video_titles:
-                text = "Фото"
+            if not text and photo_files and not video_titles and not doc_mentions:
+                text = ""
 
-            # Если есть видео — добавляем комментарий в конец текста
+            # Комментарий для видео
+            comment_blocks: List[str] = []
             if video_titles:
-                video_block = "\n\n___\n\n🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
+                video_block = "🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
                 video_block += "\n".join(f"  • {title}" for title in video_titles)
-                text = (text + video_block) if text else video_block.lstrip("\n")
+                comment_blocks.append(video_block)
+
+            # Комментарий для документов (не удалось скачать или слишком большие)
+            if doc_mentions:
+                doc_block = "📎 Документы (ссылки):\n"
+                doc_block += "\n".join(f"  {m}" for m in doc_mentions)
+                comment_blocks.append(doc_block)
+
+            if comment_blocks:
+                text = text + "\n\n" + "\n\n".join(comment_blocks) if text else "\n\n".join(comment_blocks)
 
 
             # Обогащение профиля (как было)
