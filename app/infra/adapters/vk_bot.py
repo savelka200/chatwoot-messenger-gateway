@@ -42,41 +42,61 @@ class VkAdapter(MessengerAdapter):
         cls, msg: Dict[str, Any]
     ) -> Tuple[Union[TextContent, MediaContent], List[MediaContent]]:
         """
-        Разбирает message из Callback API и возвращает:
-          (основной content, список всех медиа-вложений).
-        Поддерживает любое количество фото в одном сообщении.
+        Разбирает message из Callback API.
+        Поддерживает фото (любое количество) и видео (превью).
+        Возвращает: (основной content, список всех медиа-вложений).
         """
         text = (msg.get("text") or "").strip()
-        message_id = str(msg.get("id")) if msg.get("id") is not None else "photo"
+        message_id = str(msg.get("id")) if msg.get("id") is not None else "msg"
 
         attachments: List[MediaContent] = []
         for idx, att in enumerate(msg.get("attachments") or []):
-            if att.get("type") != "photo":
-                continue
-            photo = att.get("photo") or {}
-            url = cls.extract_vk_photo_url(photo)
-            if not url:
-                continue
-            # описание фото (если пользователь подписал саму картинку)
-            caption = (photo.get("text") or "").strip() or None
-            attachments.append(
-                MediaContent(
-                    type="media",
-                    media_type="image",
-                    url=url,
-                    caption=caption,
-                    filename=f"vk_{message_id}_{idx}.jpg",
-                    mime_type="image/jpeg",
-                )
-            )
+            att_type = att.get("type")
 
-        # Основной контент:
-        #  - если есть текст и нет фото → TextContent
-        #  - если есть фото и нет текста → первое фото как content, остальные в attachments
-        #  - если и текст, и фото → TextContent как content, все фото в attachments
+            if att_type == "photo":
+                photo = att.get("photo") or {}
+                url = cls.extract_vk_photo_url(photo)
+                if not url:
+                    continue
+                caption = (photo.get("text") or "").strip() or None
+                attachments.append(
+                    MediaContent(
+                        type="media",
+                        media_type="image",
+                        url=url,
+                        caption=caption,
+                        filename=f"vk_{message_id}_{idx}.jpg",
+                        mime_type="image/jpeg",
+                    )
+                )
+
+            elif att_type == "video":
+                video = att.get("video") or {}
+                # Берём самое большое превью из массива image
+                previews = video.get("image") or []
+                if not previews:
+                    continue
+                best_preview = max(
+                    previews,
+                    key=lambda p: p.get("width", 0) * p.get("height", 0),
+                )
+                preview_url = best_preview.get("url")
+                if not preview_url:
+                    continue
+
+                title = (video.get("title") or "").strip() or None
+                attachments.append(
+                    MediaContent(
+                        type="media",
+                        media_type="video",
+                        url=preview_url,          # URL превью (картинка)
+                        caption=title,            # Заголовок видео
+                        filename=f"vk_{message_id}_{idx}_video_preview.jpg",
+                        mime_type="image/jpeg",   # Превью — JPEG
+                    )
+                )
         if not attachments:
             return TextContent(type="text", text=text), []
-
             # Текст становится content, все фото — вложениями
         primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
         media_list = attachments

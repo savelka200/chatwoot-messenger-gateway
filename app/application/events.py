@@ -120,24 +120,58 @@ def wire_events(
             from_id = umsg.sender_id
             peer_id = umsg.recipient_id
 
-            # Скачиваем все медиа из attachments (уже распарсены адаптером)
+            # Скачиваем все медиа (фото и видео-превью — оба приходят как картинки по MIME)
             photo_files: List[Tuple[str, bytes, str]] = []
+            video_titles: List[str] = []  # собираем заголовки видео для комментария
+
             for idx, media in enumerate(umsg.attachments):
+                # === СНАЧАЛА регистрируем видео для текстового комментария ===
+                # Это делается до попытки скачивания, чтобы комментарий появился
+                # даже если превью недоступно (404, CDN недоступен и т.д.)
+                if media.media_type == "video":
+                    title = (media.caption or "без названия").strip()
+                    video_titles.append(title)
+
+                # === Теперь пытаемся скачать превью/фото ===
                 try:
                     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
                         mime = (resp.headers.get("content-type") or media.mime_type or "image/jpeg").split(";")[0]
-                    photo_files.append((media.filename or f"vk_photo_{idx}.jpg", resp.content, mime))
-                except Exception as e:
-                    logger.warning("[vk] photo download failed (%s): %s", media.url, e)
+                    photo_files.append((media.filename or f"vk_media_{idx}.jpg", resp.content, mime))
 
-            # Текст: из content (если это TextContent) или из caption первого фото
+                except httpx.HTTPStatusError as e:
+                    # Разные уровни логирования для видео и фото
+                    if media.media_type == "video":
+                        # 404 для превью видео — ожидаемое поведение (ВК часто инвалидирует CDN-ссылки)
+                        logger.info(
+                            "[vk] video preview not available (status=%s), "
+                            "will send text-only mention: %s",
+                            e.response.status_code, media.caption,
+                        )
+                    else:
+                        logger.warning(
+                            "[vk] media download failed (%s): %s", media.url, e,
+                        )
+                except Exception as e:
+                    logger.warning("[vk] media download failed (%s): %s", media.url, e)
+
+            # Собираем основной текст сообщения (как было)
             text = ""
             if isinstance(umsg.content, TextContent):
                 text = umsg.content.text.strip()
             elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
                 text = umsg.content.caption.strip()
+
+            # Fallback для пустого текста — только если нет и фото, и видео
+            if not text and photo_files and not video_titles:
+                text = "Фото"
+
+            # Если есть видео — добавляем комментарий в конец текста
+            if video_titles:
+                video_block = "\n\n___\n\n🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
+                video_block += "\n".join(f"  • {title}" for title in video_titles)
+                text = (text + video_block) if text else video_block.lstrip("\n")
 
 
             # Обогащение профиля (как было)
