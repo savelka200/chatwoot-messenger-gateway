@@ -176,6 +176,7 @@ class ChatwootService:
         content: str,
         direction: Literal["incoming", "outgoing"],
         attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+        private = False 
     ) -> int:
         message_type = "incoming" if direction == "incoming" else "outgoing"
         res = await self._client.send_message(
@@ -183,6 +184,7 @@ class ChatwootService:
             content=content or "",
             message_type=message_type,
             attachments=attachments,
+            private = private,
         )
         msg_id = (res or {}).get("id") or ((res or {}).get("payload") or {}).get("id")
         logger.info("[chatwoot] create_message id=%s type=%s", msg_id, message_type)

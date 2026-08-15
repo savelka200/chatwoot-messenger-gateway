@@ -72,6 +72,88 @@ class VkAdapter(MessengerAdapter):
         logger.info("[vk] photo uploaded: %s", att)
         return att
 
+    async def send_document(
+        self,
+        peer_id: int,
+        file_bytes: bytes,
+        filename: str = "document.bin",
+        doc_type: str = "doc",
+    ) -> str:
+        """
+        Загружает документ в ВК и возвращает строку для attachment.
+
+        Args:
+            peer_id: Идентификатор получателя
+            file_bytes: Содержимое файла
+            filename: Имя файла (обязательно с расширением)
+            doc_type: Тип документа для ВК:
+                      - "doc" — обычный документ
+                      - "audio_message" — голосовое сообщение (файл должен быть OGG)
+                      - "graffiti" — граффити (PNG без прозрачности)
+
+        Returns:
+            Строка формата "doc<owner_id>_<doc_id>" или "doc<owner_id>_<doc_id>_<access_key>"
+        """
+        if not self._http:
+            raise RuntimeError("VK HTTP client is not initialized")
+
+        # Шаг 1: Получить URL сервера загрузки
+        upload_server = await self._vk_call(
+            "docs.getMessagesUploadServer",
+            {
+                "peer_id": peer_id,
+                "type": doc_type,
+            }
+        )
+        upload_url = upload_server.get("upload_url")
+        if not upload_url:
+            raise RuntimeError("No upload_url in docs.getMessagesUploadServer response")
+
+        # Шаг 2: Загрузить файл на сервер ВК
+        # Для документов поле всегда называется "file" (не "photo" как для фото)
+        async with httpx.AsyncClient(timeout=120.0) as upload_client:
+            # Определяем MIME по расширению
+            import mimetypes
+            mime_type, _ = mimetypes.guess_type(filename)
+            mime_type = mime_type or "application/octet-stream"
+
+            files = {"file": (filename, file_bytes, mime_type)}
+            resp = await upload_client.post(upload_url, files=files)
+            resp.raise_for_status()
+            upload_result = resp.json()  # {"file": "hash_string"}
+
+        file_hash = upload_result.get("file")
+        if not file_hash:
+            raise RuntimeError("No file hash in upload response")
+
+        # Шаг 3: Сохранить документ
+        saved = await self._vk_call(
+            "docs.save",
+            {
+                "file": file_hash,
+                "title": filename,  # ВК использует это как отображаемое имя
+            }
+        )
+
+        # Ответ может быть {"type": "doc", "doc": {...}} или {"type": "audio_message", "audio_message": {...}}
+        doc_type_key = saved.get("type", doc_type)
+        doc = saved.get(doc_type_key)
+        if not doc:
+            raise RuntimeError(f"No {doc_type_key} in docs.save response")
+
+        owner_id = doc["owner_id"]
+        doc_id = doc["id"]
+        access_key = doc.get("access_key")
+
+        # Формируем строку attachment
+        att_type = "audio_message" if doc_type == "audio_message" else "doc"
+        att = f"{att_type}{owner_id}_{doc_id}"
+        if access_key:
+            att += f"_{access_key}"
+
+        logger.info("[vk] document uploaded: %s", att)
+        return att
+
     @staticmethod
     def format_reply_quote(reply_msg: Dict[str, Any]) -> str:
         """
@@ -451,12 +533,14 @@ class VkAdapter(MessengerAdapter):
         text: str,
         attachments: List[MediaContent],
         reply_to_message_id: Optional[str] = None,
-    ) -> None:
+    ) -> List[str]:  # ← ВОЗВРАЩАЕМ список ошибок
         """
         Универсальная отправка сообщения: текст + любые вложения + reply.
+        Возвращает список имён файлов, которые не удалось загрузить.
         """
         peer_id = int(recipient_id)
         attachment_strings: List[str] = []
+        failed_attachments: List[str] = []
     
         # Загружаем каждое вложение
         for media in attachments:
@@ -470,19 +554,33 @@ class VkAdapter(MessengerAdapter):
                         media.filename or "photo.jpg",
                     )
                     attachment_strings.append(att)
-                else:
-                    # На первом этапе: всё кроме фото пропускаем с предупреждением
-                    # (документы/видео/голосовые реализуем следующим шагом)
-                    logger.warning(
-                        "[vk] media_type=%s not supported for outgoing yet, skipped: %s",
-                        media.media_type, media.filename,
+    
+                elif media.media_type == "document":
+                    filename = media.filename or "document.bin"
+                    att = await self.send_document(
+                        peer_id,
+                        file_bytes,
+                        filename,
+                        doc_type="doc",
                     )
+                    attachment_strings.append(att)
+    
+                elif media.media_type == "audio":
+                    logger.warning("[vk] audio messages not yet supported for outgoing, skipped: %s", media.filename)
+                    failed_attachments.append(f"🎵 {media.filename} (аудио пока не поддерживается)")
+    
+                elif media.media_type == "video":
+                    logger.warning("[vk] video not yet supported for outgoing, skipped: %s", media.filename)
+                    failed_attachments.append(f"🎬 {media.filename} (видео пока не поддерживается)")
+    
+                else:
+                    logger.warning("[vk] unknown media_type=%s, skipped: %s", media.media_type, media.filename)
+                    failed_attachments.append(f"📎 {media.filename} (неизвестный тип)")
+    
             except Exception as e:
-                logger.error(
-                    "[vk] failed to upload attachment %s: %s",
-                    media.url, e,
-                )
-                # Продолжаем — отправим хотя бы текст и остальные вложения
+                logger.error("[vk] failed to upload attachment %s: %s", media.url, e)
+                # === ИСПРАВЛЕНО: добавляем в список ошибок ===
+                failed_attachments.append(f"📎 {media.filename}")
     
         # Формируем параметры messages.send
         params: Dict[str, Any] = {
@@ -496,16 +594,16 @@ class VkAdapter(MessengerAdapter):
         if reply_to_message_id:
             params["reply_to"] = int(reply_to_message_id)
     
-        # Проверяем, что есть что отправлять
-        if not text and not attachment_strings:
-            logger.warning("[vk] nothing to send (empty text, no attachments uploaded)")
-            return
+        # Отправляем основное сообщение
+        if text or attachment_strings:
+            try:
+                res = await self._vk_call("messages.send", params)
+                logger.info(
+                    "[vk] SENT: peer_id=%s text=%r attachments=%d reply=%s result=%s",
+                    peer_id, (text or "")[:50], len(attachment_strings), reply_to_message_id, res,
+                )
+            except Exception as e:
+                logger.exception("[vk] Failed to send message to %s: %s", peer_id, e)
     
-        try:
-            res = await self._vk_call("messages.send", params)
-            logger.info(
-                "[vk] SENT: peer_id=%s text=%r attachments=%d reply=%s result=%s",
-                peer_id, (text or "")[:50], len(attachment_strings), reply_to_message_id, res,
-            )
-        except Exception as e:
-            logger.exception("[vk] Failed to send message to %s: %s", peer_id, e)
+        # Возвращаем список ошибок для уведомления оператора
+        return failed_attachments
