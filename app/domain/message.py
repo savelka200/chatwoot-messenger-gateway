@@ -1,4 +1,4 @@
-from typing import Annotated, Any, Dict, Literal, Union
+from typing import Annotated, Any, Dict, Literal, Union, List
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -58,4 +58,5 @@ class UnifiedMessage(BaseModel):
     sender_id: str | None = None
     sender_name: str | None = None
     content: Content
+    attachments: List[MediaContent] = []
     raw: dict | None = None

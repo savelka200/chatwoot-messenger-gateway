@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, List, Tuple
 
 import httpx
 from pyee.asyncio import AsyncIOEventEmitter
@@ -8,6 +8,8 @@ from app.application.chatwoot_service import ChatwootService
 from app.application.router import MessageRouter
 from app.config import AppConfig
 from app.infra.chatwoot_client import ChatwootClient
+from app.domain.message import UnifiedMessage, TextContent, MediaContent
+
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +106,8 @@ def wire_events(
         except Exception as e:
             logger.exception("[events] wasender handling failed: %s", e)
 
-    @bus.on("vk.incoming")
-    async def _ingest_vk(payload: Dict[str, Any]) -> None:
+    @bus.on("vk.message")
+    async def _ingest_vk(umsg: UnifiedMessage) -> None:
         """
         VK (Callback API) incoming:
         - enrich contact with name (first+last; fallback to screen_name) and bdate
@@ -114,12 +116,31 @@ def wire_events(
         - rely on ensure_contact() to find by /contacts/filter
         """
         try:
-            message = payload.get("message") or {}
-            text = (message.get("text") or "").strip()
-            peer_id = str(message.get("peer_id") or "")
-            from_id = str(message.get("from_id") or peer_id)
+            # Извлекаем данные из UnifiedMessage
+            from_id = umsg.sender_id
+            peer_id = umsg.recipient_id
 
-            # Enrich with profile
+            # Скачиваем все медиа из attachments (уже распарсены адаптером)
+            photo_files: List[Tuple[str, bytes, str]] = []
+            for idx, media in enumerate(umsg.attachments):
+                try:
+                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as dl:
+                        resp = await dl.get(str(media.url))
+                        resp.raise_for_status()
+                        mime = (resp.headers.get("content-type") or media.mime_type or "image/jpeg").split(";")[0]
+                    photo_files.append((media.filename or f"vk_photo_{idx}.jpg", resp.content, mime))
+                except Exception as e:
+                    logger.warning("[vk] photo download failed (%s): %s", media.url, e)
+
+            # Текст: из content (если это TextContent) или из caption первого фото
+            text = ""
+            if isinstance(umsg.content, TextContent):
+                text = umsg.content.text.strip()
+            elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
+                text = umsg.content.caption.strip()
+
+
+            # Обогащение профиля (как было)
             vk_name: Optional[str] = None
             vk_bdate: Optional[str] = None
             additional_attributes: Dict[str, Any] = {}
@@ -167,23 +188,23 @@ def wire_events(
                 phone=None,
                 email=None,
                 custom_attributes=custom_attributes,
-                additional_attributes=additional_attributes,  # pass city here
-                avatar_url=photo
+                additional_attributes=additional_attributes,
+                avatar_url=profile.get("photo_200") if profile else None
             )
-
+    
             conv_id = await cw.ensure_conversation(
                 inbox_id=inbox_id,
                 contact_id=ensured["id"],
                 source_id=ensured["source_id"],
             )
+    
             await cw.create_message(
                 conversation_id=conv_id,
                 content=text,
                 direction="incoming",
+                attachments=photo_files or None,
             )
-            logger.info(
-                "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
-            )
+            logger.info("[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id)
         except Exception as e:
             logger.exception("[events] vk handling failed: %s", e)
 

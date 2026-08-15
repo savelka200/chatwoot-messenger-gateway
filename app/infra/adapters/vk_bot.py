@@ -1,12 +1,12 @@
 import logging
 import secrets
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union, List
 
 import httpx  # NEW
 from pyee.asyncio import AsyncIOEventEmitter
 
 from app.config import VKCommunityConfig
-from app.domain.message import TextContent, UnifiedMessage
+from app.domain.message import TextContent, UnifiedMessage, MediaContent
 from app.domain.ports import MessengerAdapter, OnMessage
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,69 @@ class VkAdapter(MessengerAdapter):
         self._confirm_listener: Optional[Callable[..., Awaitable[None]]] = None
         self._http: Optional[httpx.AsyncClient] = None  # NEW
 
+
+    @staticmethod
+    def extract_vk_photo_url(photo: Dict[str, Any]) -> Optional[str]:
+        #orig_photo → самый крупный size
+        orig_url = (photo.get("orig_photo") or {}).get("url")
+        if orig_url:
+            return orig_url
+        sizes = photo.get("sizes") or []
+        if not sizes:
+            return None
+        best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+        return best.get("url")
+
+    @classmethod
+    def parse_vk_media(
+        cls, msg: Dict[str, Any]
+    ) -> Tuple[Union[TextContent, MediaContent], List[MediaContent]]:
+        """
+        Разбирает message из Callback API и возвращает:
+          (основной content, список всех медиа-вложений).
+        Поддерживает любое количество фото в одном сообщении.
+        """
+        text = (msg.get("text") or "").strip()
+        message_id = str(msg.get("id")) if msg.get("id") is not None else "photo"
+
+        attachments: List[MediaContent] = []
+        for idx, att in enumerate(msg.get("attachments") or []):
+            if att.get("type") != "photo":
+                continue
+            photo = att.get("photo") or {}
+            url = cls.extract_vk_photo_url(photo)
+            if not url:
+                continue
+            # описание фото (если пользователь подписал саму картинку)
+            caption = (photo.get("text") or "").strip() or None
+            attachments.append(
+                MediaContent(
+                    type="media",
+                    media_type="image",
+                    url=url,
+                    caption=caption,
+                    filename=f"vk_{message_id}_{idx}.jpg",
+                    mime_type="image/jpeg",
+                )
+            )
+
+        # Основной контент:
+        #  - если есть текст и нет фото → TextContent
+        #  - если есть фото и нет текста → первое фото как content, остальные в attachments
+        #  - если и текст, и фото → TextContent как content, все фото в attachments
+        if not attachments:
+            return TextContent(type="text", text=text), []
+
+            # Текст становится content, все фото — вложениями
+        primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
+        media_list = attachments
+
+        return primary, media_list
+
+    @classmethod
+    def _build_content(cls, msg, *_args):
+        return cls.parse_vk_media(msg)
+
     def on_message(self, cb: OnMessage) -> None:
         self._cb = cb
 
@@ -40,41 +103,65 @@ class VkAdapter(MessengerAdapter):
             )
 
         async def _on_vk_incoming(payload: Dict[str, Any]) -> None:
-            if payload.get("event") != "message_new" or not self._cb:
+            if payload.get("event") != "message_new":
                 return
-
+        
             msg = payload.get("message") or {}
-            text = (msg.get("text") or "").strip()
-            peer_id = str(msg.get("peer_id")) if msg.get("peer_id") is not None else ""
-            from_id = (
-                str(msg.get("from_id")) if msg.get("from_id") is not None else peer_id
-            )
-            message_id = str(msg.get("id")) if msg.get("id") is not None else None
-
-            if not self._cb or not peer_id:
-                logger.debug("[vk] skip incoming: no callback or missing peer_id")
+            peer_id = msg.get("peer_id")
+            from_id = msg.get("from_id") or peer_id
+            message_id = msg.get("id")
+            conversation_message_id = msg.get("conversation_message_id")
+        
+            if not peer_id:
+                logger.debug("[vk] skip incoming: missing peer_id")
                 return
-
-            content = TextContent(type="text", text=text)
+        
+            # === ПРОВЕРКА НА is_cropped ===
+            # ВК присылает is_cropped=true, если в webhook влезли не все вложения
+            is_cropped = bool(msg.get("is_cropped"))
+            if is_cropped and conversation_message_id is not None:
+                logger.info(
+                    "[vk] is_cropped=true detected, fetching full message (peer=%s, cmid=%s)",
+                    peer_id, conversation_message_id,
+                )
+                full_msg = await self._fetch_full_message(
+                    peer_id=int(peer_id),
+                    conversation_message_id=int(conversation_message_id),
+                )
+                if full_msg:
+                    msg = full_msg  # подменяем на полную версию
+                    logger.info(
+                        "[vk] fetched full message: %d attachments",
+                        len(msg.get("attachments") or []),
+                    )
+                else:
+                    logger.warning("[vk] fallback to cropped payload")
+        
+            # Обновляем ID из (возможно, полного) msg
+            from_id = str(msg.get("from_id") or peer_id)
+            peer_id_str = str(peer_id)
+            message_id = str(msg.get("id")) if msg.get("id") is not None else None
+        
+            content, attachments = self._build_content(msg)
+        
             umsg = UnifiedMessage(
                 channel="vk",
                 sender_id=from_id,
-                recipient_id=peer_id,
+                recipient_id=peer_id_str,
                 message_id=message_id,
                 content=content,
-                raw=payload,
+                attachments=attachments,
+                raw=payload,  # оригинал сохраняем для отладки
             )
-            await self._cb(umsg)
+            self._bus.emit("vk.message", umsg)
 
         async def _on_vk_confirmation(payload: Dict[str, Any]) -> None:
             group_id = payload.get("group_id")
-            logger.info("[vk] confirmation request received for group_id=%s", group_id)
-
+            logger.info("[vk] confirmation request received for group_id=%s", group_id) 
         self._incoming_listener = _on_vk_incoming
         self._confirm_listener = _on_vk_confirmation
         self._bus.on("vk.incoming", self._incoming_listener)
-        self._bus.on("vk.confirmation", self._confirm_listener)
-
+        self._bus.on("vk.confirmation", self._confirm_listener) 
         logger.info("[vk] adapter started (callback API, text only)")
 
     async def stop(self) -> None:
@@ -101,6 +188,36 @@ class VkAdapter(MessengerAdapter):
             self._http = None
 
         logger.info("[vk] adapter stopped")
+
+    async def _fetch_full_message(
+        self, peer_id: int, conversation_message_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Если ВК прислал is_cropped=true, получаем полное сообщение через API,
+        чтобы достать все вложения.
+        """
+        if not self._http:
+            return None
+        try:
+            data = await self._vk_call(
+                "messages.getByConversationMessageId",
+                {
+                    "peer_id": peer_id,
+                    "conversation_message_ids": conversation_message_id,
+                },
+            )
+            # Ответ: {"count": N, "items": [...]}
+            items = (data or {}).get("items") or []
+            if not items:
+                logger.warning("[vk] getByConversationMessageId returned no items")
+                return None
+            return items[0]
+        except Exception as e:
+            logger.warning(
+                "[vk] failed to fetch full message (peer=%s, cmid=%s): %s",
+                peer_id, conversation_message_id, e,
+            )
+            return None
 
     async def _vk_call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """VK API call with basic error handling."""
