@@ -1,4 +1,4 @@
-from typing import Annotated, Any, Dict, Literal, Union
+from typing import Annotated, Any, Dict, Literal, Union, List
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -16,6 +16,7 @@ class MediaContent(BaseModel):
     caption: str | None = None
     filename: str | None = None
     mime_type: str | None = None
+    raw: Dict[str, Any] = {}
 
 
 class StickerContent(BaseModel):
@@ -58,4 +59,5 @@ class UnifiedMessage(BaseModel):
     sender_id: str | None = None
     sender_name: str | None = None
     content: Content
+    attachments: List[MediaContent] = []
     raw: dict | None = None

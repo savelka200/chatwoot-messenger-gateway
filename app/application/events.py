@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, List, Tuple
 
 import httpx
 from pyee.asyncio import AsyncIOEventEmitter
@@ -8,8 +8,19 @@ from app.application.chatwoot_service import ChatwootService
 from app.application.router import MessageRouter
 from app.config import AppConfig
 from app.infra.chatwoot_client import ChatwootClient
+from app.domain.message import UnifiedMessage, TextContent, MediaContent
+
 
 logger = logging.getLogger(__name__)
+MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
+
+def _format_size(size_bytes: int) -> str:
+    """Человекочитаемый размер файла."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if size_bytes < 1024 or unit == "GB":
+            return f"{size_bytes:.1f} {unit}" if unit != "B" else f"{size_bytes} B"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} GB"
 
 
 async def _fetch_vk_profile(
@@ -104,8 +115,8 @@ def wire_events(
         except Exception as e:
             logger.exception("[events] wasender handling failed: %s", e)
 
-    @bus.on("vk.incoming")
-    async def _ingest_vk(payload: Dict[str, Any]) -> None:
+    @bus.on("vk.message")
+    async def _ingest_vk(umsg: UnifiedMessage) -> None:
         """
         VK (Callback API) incoming:
         - enrich contact with name (first+last; fallback to screen_name) and bdate
@@ -114,12 +125,99 @@ def wire_events(
         - rely on ensure_contact() to find by /contacts/filter
         """
         try:
-            message = payload.get("message") or {}
-            text = (message.get("text") or "").strip()
-            peer_id = str(message.get("peer_id") or "")
-            from_id = str(message.get("from_id") or peer_id)
+            # Извлекаем данные из UnifiedMessage
+            from_id = umsg.sender_id
+            peer_id = umsg.recipient_id
 
-            # Enrich with profile
+            # Скачиваем все медиа (фото и видео-превью — оба приходят как картинки по MIME)
+            photo_files: List[Tuple[str, bytes, str]] = []
+            video_titles: List[str] = []  # собираем заголовки видео для комментария
+            doc_mentions: List[str] = []
+            voice_mentions: List[str] = []
+
+            for idx, media in enumerate(umsg.attachments):
+                # Регистрация для текстовых комментариев
+                if media.media_type == "video":
+                    title = (media.caption or "без названия").strip()
+                    video_titles.append(title)          
+
+                # === Скачивание ===
+                try:
+                    if media.media_type == "document":
+                        size = (media.raw or {}).get("size")
+                        if size and size > MAX_DOC_SIZE_BYTES:
+                            doc_mentions.append(
+                                f"📎 {media.caption} ({_format_size(size)}): {media.url}"
+                            )
+                            logger.info(
+                                "[vk] doc too large (%s bytes), sending link only: %s",
+                                size, media.caption,
+                            )
+                            continue            
+
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                        resp = await dl.get(str(media.url))
+                        resp.raise_for_status()
+                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
+                    photo_files.append((media.filename or f"vk_media_{idx}", resp.content, mime))           
+
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    if media.media_type == "video":
+                        logger.info("[vk] video preview not available (status=%s): %s", status, media.caption)
+                    elif media.media_type == "document":
+                        doc_mentions.append(f"📎 {media.caption}: {media.url}")
+                        logger.warning("[vk] doc download failed (status=%s), sending link: %s", status, media.caption)
+                    elif media.media_type == "audio":
+                        duration = (media.raw or {}).get("duration", 0)
+                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
+                        logger.warning("[vk] voice message download failed (status=%s), sending text mention", status)
+                    else:
+                        logger.warning("[vk] media download failed (%s): %s", media.url, e)
+                except Exception as e:
+                    if media.media_type == "document":
+                        doc_mentions.append(f"📎 {media.caption}: {media.url}")
+                        logger.warning("[vk] doc download failed, sending link: %s — %s", media.caption, e)
+                    elif media.media_type == "audio":
+                        duration = (media.raw or {}).get("duration", 0)
+                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
+                        logger.warning("[vk] voice message download failed: %s", e)
+                    else:
+                        logger.warning("[vk] media download failed (%s): %s", media.url, e)         
+
+            # Собираем основной текст сообщения
+            text = ""
+            if isinstance(umsg.content, TextContent):
+                text = umsg.content.text.strip()
+            elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
+                text = umsg.content.caption.strip()         
+
+            if not text and photo_files and not video_titles and not doc_mentions and not voice_mentions:
+                text = "Вложения"           
+
+            # Формируем блоки комментариев
+            comment_blocks: List[str] = []          
+
+            if video_titles:
+                video_block = "🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
+                video_block += "\n".join(f"  • {title}" for title in video_titles)
+                comment_blocks.append(video_block)          
+
+            if doc_mentions:
+                doc_block = "📎 Документы (ссылки):\n"
+                doc_block += "\n".join(f"  {m}" for m in doc_mentions)
+                comment_blocks.append(doc_block)            
+
+            if voice_mentions:
+                voice_block = "🎤 Голосовые сообщения (не удалось скачать):\n"
+                voice_block += "\n".join(f"  {m}" for m in voice_mentions)
+                comment_blocks.append(voice_block)          
+
+            if comment_blocks:
+                text = text + "\n\n" + "\n\n".join(comment_blocks) if text else "\n\n".join(comment_blocks)
+
+
+            # Обогащение профиля (как было)
             vk_name: Optional[str] = None
             vk_bdate: Optional[str] = None
             additional_attributes: Dict[str, Any] = {}
@@ -167,23 +265,23 @@ def wire_events(
                 phone=None,
                 email=None,
                 custom_attributes=custom_attributes,
-                additional_attributes=additional_attributes,  # pass city here
-                avatar_url=photo
+                additional_attributes=additional_attributes,
+                avatar_url=profile.get("photo_200") if profile else None
             )
-
+    
             conv_id = await cw.ensure_conversation(
                 inbox_id=inbox_id,
                 contact_id=ensured["id"],
                 source_id=ensured["source_id"],
             )
+    
             await cw.create_message(
                 conversation_id=conv_id,
                 content=text,
                 direction="incoming",
+                attachments=photo_files or None,
             )
-            logger.info(
-                "[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id
-            )
+            logger.info("[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id)
         except Exception as e:
             logger.exception("[events] vk handling failed: %s", e)
 

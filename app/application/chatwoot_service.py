@@ -1,6 +1,7 @@
 import logging
-from typing import Any, Dict, Literal, Optional
-
+from typing import Any, Dict, List, Literal, Optional, Tuple
+import httpx
+import io
 from app.infra.chatwoot_client import ChatwootClient
 
 logger = logging.getLogger(__name__)
@@ -166,18 +167,24 @@ class ChatwootService:
         logger.info("[chatwoot] create conversation id=%s inbox=%s", conv_id, inbox_id)
         return int(conv_id)
 
+
+
     async def create_message(
         self,
         *,
         conversation_id: int,
         content: str,
         direction: Literal["incoming", "outgoing"],
+        attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+        private = False 
     ) -> int:
         message_type = "incoming" if direction == "incoming" else "outgoing"
         res = await self._client.send_message(
             conversation_id=conversation_id,
             content=content or "",
             message_type=message_type,
+            attachments=attachments,
+            private = private,
         )
         msg_id = (res or {}).get("id") or ((res or {}).get("payload") or {}).get("id")
         logger.info("[chatwoot] create_message id=%s type=%s", msg_id, message_type)

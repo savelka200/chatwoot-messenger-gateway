@@ -1,7 +1,8 @@
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Tuple
+import logging
 import httpx
 
+logger = logging.getLogger(__name__)
 
 class ChatwootClient:
     """
@@ -162,19 +163,82 @@ class ChatwootClient:
             return r.json()
 
     # Messages
+
     async def send_message(
         self,
         conversation_id: int,
         content: str,
+        attachments: Optional[List[Tuple[str, bytes, str]]] = None,
         **extra_fields: Any,
     ) -> Dict[str, Any]:
-        """Send a message to a conversation."""
-        url = f"{self._account_base}/conversations/{conversation_id}/messages"
-        payload: Dict[str, Any] = {"content": content}
-        if extra_fields:
-            payload.update(extra_fields)
+        """
+        Send a message to a conversation.
+        - Text only -> application/json
+        - With attachments -> multipart/form-data
+        attachments: list of (filename, file_bytes, mime_type)
+        """
+        import io
 
-        async with httpx.AsyncClient(headers=self._headers, timeout=15.0) as client:
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            return r.json()
+        url = f"{self._account_base}/conversations/{conversation_id}/messages"
+
+    async def send_message(
+        self,
+        conversation_id: int,
+        content: str,
+        attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+        **extra_fields: Any,
+    ) -> Dict[str, Any]:
+        import io
+    
+        url = f"{self._account_base}/conversations/{conversation_id}/messages"
+    
+        # Только auth-заголовки, БЕЗ Content-Type
+        auth_headers = {
+            "api_access_token": self._headers.get("api_access_token"),
+            "Authorization": self._headers.get("Authorization"),
+        }
+    
+        if attachments:
+            # Определяем file_type
+            first_mime = attachments[0][2] if attachments else "image/jpeg"
+            if "image" in first_mime:
+                file_type = "image"
+            elif "video" in first_mime:
+                file_type = "video"
+            elif "audio" in first_mime:
+                file_type = "audio"
+            else:
+                file_type = "file"
+    
+            # Всё через files=[] в формате (field, (filename_or_None, content, mime))
+            # Текстовые поля: filename=None означает обычное form-field
+            files = [
+                ("attachments[]", (filename, io.BytesIO(body), mime_type))
+                for filename, body, mime_type in attachments
+            ]
+            files.append(("content", (None, content or "", None)))
+            files.append(("message_type", (None, str(extra_fields.get("message_type", "outgoing")), None)))
+            files.append(("file_type", (None, file_type, None)))
+    
+            logger.info("[chatwoot] Sending multipart: %d files, file_type=%s",
+                       len(attachments), file_type)
+    
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(url, files=files, headers=auth_headers)
+        else:
+            # Для JSON используем стандартные заголовки
+            headers = {**self._headers}  # копия со всеми полями
+            payload: Dict[str, Any] = {"content": content}
+            payload.update(extra_fields)
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(url, json=payload, headers=headers)
+    
+        if r.status_code >= 400:
+            logger.error(
+                "[chatwoot] send_message failed: status=%s response=%s",
+                r.status_code,
+                r.text
+            )
+        r.raise_for_status()
+        return r.json()
