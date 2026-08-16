@@ -36,12 +36,22 @@ class ChatwootWebhookConfig(BaseModel):
     # Map webhook id -> channel name
     channel_by_webhook_id: Dict[str, str] = Field(default_factory=dict)
 
+class OKConfig(BaseModel):
+    access_token: str
+    group_id: Optional[str] = None
+    inbox_id: int
+    webhook_id: str
+    auto_subscribe: bool = True
 
 class AppConfig(BaseModel):
     telegram: Optional[TelegramConfig] = None
     wasender: Optional[WasenderWebhookConfig] = None
     vk: Optional[VKCommunityConfig] = None
     chatwoot: ChatwootWebhookConfig
+    ok: Optional[OKConfig] = None
+    gateway_base_url: Optional[str] = None
+
+ 
 
 
 def _getenv(name: str) -> str:
@@ -58,12 +68,15 @@ def _build_channel_map() -> Dict[str, str]:
     w = os.getenv("CHATWOOT_WEBHOOK_ID_WHATSAPP")
     t = os.getenv("CHATWOOT_WEBHOOK_ID_TELEGRAM")
     v = os.getenv("CHATWOOT_WEBHOOK_ID_VK")
+    o = os.getenv("CHATWOOT_WEBHOOK_ID_OK")
     if w:
         mapping[w] = "whatsapp"
     if t:
         mapping[t] = "telegram"
     if v:
         mapping[v] = "vk"
+    if o:
+        mapping[o] = "ok"
     return mapping
 
 
@@ -119,10 +132,22 @@ def load_config() -> AppConfig:
         else:
             vk_cfg = None
 
+        ok_cfg = None
+        if os.getenv("OK_ACCESS_TOKEN") and os.getenv("OK_INBOX_ID"):
+            ok_cfg = OKConfig(
+                access_token=_getenv("OK_ACCESS_TOKEN"),
+                group_id=os.getenv("OK_GROUP_ID"),
+                inbox_id=int(_getenv("OK_INBOX_ID")),
+                webhook_id=os.getenv("OK_WEBHOOK_ID") or "228",
+                auto_subscribe=os.getenv("OK_AUTO_SUBSCRIBE", "true").lower() == "true",
+            )
+
         return AppConfig(
             telegram=telegram_cfg,
             wasender=wasender_cfg,
             vk=vk_cfg,
+            ok=ok_cfg,  # НОВОЕ
+            gateway_base_url=os.getenv("GATEWAY_BASE_URL"),  # НОВОЕ
             chatwoot=ChatwootWebhookConfig(
                 api_access_token=_getenv("CHATWOOT_API_ACCESS_TOKEN"),
                 account_id=int(_getenv("CHATWOOT_ACCOUNT_ID")),
@@ -130,5 +155,8 @@ def load_config() -> AppConfig:
                 channel_by_webhook_id=_build_channel_map(),
             ),
         )
+
+
+    
     except ValidationError as e:
         raise RuntimeError(f"Invalid configuration: {e}") from e

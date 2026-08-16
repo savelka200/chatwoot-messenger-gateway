@@ -10,9 +10,18 @@ from app.config import AppConfig
 from app.infra.chatwoot_client import ChatwootClient
 from app.domain.message import UnifiedMessage, TextContent, MediaContent
 
+from contextlib import asynccontextmanager
+from app.infra.adapters.ok_bot import OKAdapter
+
+import re
+from urllib.parse import unquote
+
 
 logger = logging.getLogger(__name__)
 MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
+
+
+
 
 def _format_size(size_bytes: int) -> str:
     """Человекочитаемый размер файла."""
@@ -351,3 +360,215 @@ def wire_events(
             )
         except Exception as e:
             logger.exception("[events] telegram handling failed: %s", e)
+
+    @bus.on("ok.incoming")
+    async def _ingest_ok(payload: Dict[str, Any]) -> None:
+        """Обрабатывает входящее сообщение из Одноклассников."""
+        try:
+            sender_raw = payload.get("sender", {}).get("user_id", "")
+            chat_id = payload.get("recipient", {}).get("chat_id", "")
+            msg = payload.get("message") or {}
+
+            # Извлекаем user_id из строки "user:123456789012"
+            user_id = sender_raw.split(":")[-1] if ":" in sender_raw else sender_raw
+
+            # Парсим текст и вложения
+            content, attachments = OKAdapter.parse_ok_media(msg)
+
+            # Карта MIME → расширение для добавления к именам без расширения
+            MIME_TO_EXT = {
+                "application/pdf": "pdf",
+                "application/msword": "doc",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/vnd.ms-excel": "xls",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+                "application/vnd.ms-powerpoint": "ppt",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+                "application/zip": "zip",
+                "application/x-rar-compressed": "rar",
+                "application/x-7z-compressed": "7z",
+                "application/octet-stream": None,  # универсальный, не добавляем
+                "video/mp4": "mp4",
+                "video/webm": "webm",
+                "video/quicktime": "mov",
+                "video/x-msvideo": "avi",
+                "audio/mpeg": "mp3",
+                "audio/ogg": "ogg",
+                "audio/wav": "wav",
+                "audio/x-wav": "wav",
+                "text/plain": "txt",
+            }
+
+            # Скачиваем все медиа
+            media_files: List[Tuple[str, bytes, str]] = []
+            video_links_for_text: List[str] = []  # ссылки на плееры, которые не удалось извлечь как файл
+
+            for idx, media in enumerate(attachments):
+                try:
+                    # === Специальная обработка для видео ===
+                    if media.media_type == "video":
+                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                            resp = await dl.get(str(media.url))
+                            resp.raise_for_status()
+
+                            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                            logger.info("[ok] video response: content-type=%s, length=%d", content_type, len(resp.content))
+
+                            # Если это HTML-страница (content-type text/html), ищем прямую ссылку
+                            if "text/html" in content_type or "ok.ru/video/" in str(media.url):
+                                html_content = resp.text
+                                direct_url = OKAdapter.extract_direct_video_url(html_content)
+
+                                if direct_url:
+                                    logger.info("[ok] found direct video URL: %s", direct_url[:100])
+                                    # Скачиваем видео по прямой ссылке
+                                    video_resp = await dl.get(direct_url)
+                                    video_resp.raise_for_status()
+
+                                    # Определяем имя и расширение
+                                    video_filename = media.caption or f"ok_video_{idx}.mp4"
+                                    if not video_filename.lower().endswith(".mp4"):
+                                        video_filename += ".mp4"
+
+                                    mime = (video_resp.headers.get("content-type") or "video/mp4").split(";")[0].strip()
+                                    media_files.append((video_filename, video_resp.content, mime))
+                                    logger.info("[ok] video downloaded: %s (%d bytes)", video_filename, len(video_resp.content))
+                                else:
+                                    # Не удалось извлечь прямую ссылку — добавляем ссылку на плеер в текст
+                                    logger.warning("[ok] could not extract direct video URL, adding link to text")
+                                    video_links_for_text.append(
+                                        f"🎬 Видео: {media.caption or 'Без названия'} — {media.url}"
+                                    )
+                            else:
+                                # Это прямой видеофайл — используем как есть
+                                video_filename = media.caption or f"ok_video_{idx}.mp4"
+                                if "." not in video_filename.rsplit("/", 1)[-1]:
+                                    video_filename += ".mp4"
+                                media_files.append((video_filename, resp.content, content_type or "video/mp4"))
+
+                        continue
+                    
+                    # === Обычная обработка для остальных типов (документы, фото, аудио) ===
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                        resp = await dl.get(str(media.url))
+                        resp.raise_for_status()
+
+                        filename = media.filename
+                        mime_from_header = (resp.headers.get("content-type") or "").split(";")[0].strip()
+
+                        if media.media_type in ("document", "audio"):
+                            # Извлекаем имя из Content-Disposition
+                            content_disp = resp.headers.get("content-disposition", "")
+                            if content_disp:
+                                match_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)", content_disp, re.I)
+                                match_plain = re.search(r'filename\s*=\s*"?([^";\s]+)"?', content_disp, re.I)
+
+                                if match_utf8:
+                                    filename = unquote(match_utf8.group(1).strip())
+                                    logger.info("[ok] extracted filename (UTF-8): %s", filename)
+                                elif match_plain:
+                                    filename = unquote(match_plain.group(1).strip())
+                                    logger.info("[ok] extracted filename: %s", filename)
+
+                            if filename and "." not in filename.rsplit("/", 1)[-1] and mime_from_header:
+                                ext = MIME_TO_EXT.get(mime_from_header)
+                                if ext:
+                                    filename = f"{filename}.{ext}"
+                                    logger.info("[ok] added extension .%s", ext)
+
+                        mime = mime_from_header or media.mime_type or "application/octet-stream"
+
+                    media_files.append((filename or f"ok_media_{idx}", resp.content, mime))
+
+                except Exception as e:
+                    logger.warning("[ok] media download failed (%s): %s", media.url, e)
+
+            # === Формирование финального текста ===
+
+            # 1. Базовый текст сообщения от пользователя
+            base_text = ""
+            if isinstance(content, TextContent):
+                base_text = content.text.strip()
+
+            # 2. Блок с ссылками на видео (если не удалось скачать)
+            video_block = ""
+            if video_links_for_text:
+                video_block = "📹 Пользователь прислал видео (откройте в ОК)\n"
+
+            # 3. Объединяем
+            if base_text and video_block:
+                final_text = f"{base_text}\n\n{video_block}"
+            elif base_text:
+                final_text = base_text
+            elif video_block:
+                final_text = video_block
+            elif media_files:
+                final_text = "Медиа"
+            else:
+                final_text = ""
+
+            # Логируем, что получилось
+            logger.info(
+                "[ok] final message: text=%r media_files=%d video_links=%d",
+                final_text[:100] if final_text else "",
+                len(media_files),
+                len(video_links_for_text),
+            )
+
+            # === ПОЛУЧЕНИЕ ПРОФИЛЯ ПОЛЬЗОВАТЕЛЯ ===
+            ok_adapter = adapters.get("ok")
+            profile = {}
+            ok_name = f"OK User {user_id}"
+            avatar_url = None
+
+            if ok_adapter:
+                # Передаём chat_id для запроса сообщений
+                profile = await ok_adapter.get_user_profile(sender_raw, chat_id)
+                if profile.get("name"):
+                    ok_name = profile["name"]
+                    logger.info("[ok] got user name from messages: %s", ok_name)
+
+            inbox_id = getattr(ok_adapter, "inbox_id", None) if ok_adapter else None
+            if not inbox_id:
+                raise RuntimeError("OK inbox_id is not configured")
+
+            custom_attributes = {
+                "ok_user_id": sender_raw,
+                "ok_chat_id": chat_id,
+            }
+            additional_attributes = {}
+            if profile:
+                if profile.get("city"):
+                    additional_attributes["city"] = profile["city"]
+                if profile.get("birthday"):
+                    additional_attributes["birthday"] = profile["birthday"]
+
+            ensured = await cw.ensure_contact(
+                inbox_id=inbox_id,
+                search_key=user_id,
+                name=ok_name,
+                phone=None,
+                email=None,
+                custom_attributes=custom_attributes,
+                additional_attributes=additional_attributes,
+                avatar_url=avatar_url,
+            )
+
+            conv_id = await cw.ensure_conversation(
+                inbox_id=inbox_id,
+                contact_id=ensured["id"],
+                source_id=ensured["source_id"],
+            )
+
+            await cw.create_message(
+                conversation_id=conv_id,
+                content=final_text,
+                direction="incoming",
+                attachments=media_files or None,
+            )
+            logger.info(
+                "[events] ok -> chatwoot OK conv_id=%s inbox=%s name=%s",
+                conv_id, inbox_id, ok_name,
+            )
+        except Exception as e:
+            logger.exception("[events] ok handling failed: %s", e)

@@ -15,6 +15,7 @@ from app.delivery.http import create_router
 from app.infra.adapters.telegram_telethon import TelegramAdapter
 from app.infra.adapters.vk_bot import VkAdapter
 from app.infra.adapters.whatsapp_wasender import WasenderAdapter
+from app.infra.adapters.ok_bot import OKAdapter
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -39,6 +40,11 @@ if config.telegram:
 if config.vk:
     adapters["vk"] = VkAdapter(bus=bus, config=config.vk)
 
+if config.ok:
+    ok_adapter = OKAdapter(bus=bus, config=config.ok)
+    adapters["ok"] = ok_adapter
+
+
 router = MessageRouter(adapters=adapters)
 
 # Wire adapter incoming → application router (existing behavior)
@@ -51,6 +57,17 @@ wire_events(bus=bus, config=config, adapters=adapters, router=router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # === НОВОЕ: Автоматическая подписка на webhook ОК ===
+    if config.ok and config.ok.auto_subscribe:
+        ok_adapter = adapters.get("ok")
+        if ok_adapter:
+            webhook_url = f"{config.gateway_base_url.rstrip('/')}/ok/callback/{config.ok.webhook_id}"
+            logging.info("[main] subscribing OK webhook to: %s", webhook_url)
+            await ok_adapter.start()  # Запускаем адаптер перед подпиской
+            success = await ok_adapter.subscribe_to_webhook(webhook_url)
+            if not success:
+                logging.warning("[main] OK webhook subscription failed, check manually")
+
     # Log here (server process only; avoids duplicate logs from reloader)
     logging.info("adapters configured: %s", list(adapters.keys()))
     await asyncio.gather(
@@ -62,7 +79,6 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(
             *(a.stop() for a in adapters.values()), return_exceptions=True
         )
-
 
 app = FastAPI(title="Messaging Bridge", version="0.1.0", lifespan=lifespan)
 app.include_router(create_router(bus=bus, config=config))

@@ -88,39 +88,34 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
 
     @router.post("/chatwoot/webhook/{webhook_id}", response_model=dict)
     async def chatwoot_webhook(webhook_id: str, request: Request):
-        # Determine channel by webhook_id (per-channel hooks) or fallback to legacy id
         channel = config.chatwoot.channel_by_webhook_id.get(webhook_id)
-        if not channel and webhook_id != config.chatwoot.webhook_id:
-            raise HTTPException(status_code=403, detail="Unknown webhook ID")
-
+        if not channel:
+            raise HTTPException(status_code=403, detail=f"Unknown webhook ID: {webhook_id}")
+    
         payload = await request.json()
         event = payload.get("event")
         msg_type = payload.get("message_type")
-
-        # Ensure conversation/meta exists and inject channel if detected
+    
+        # Инжектим channel в метаданные
         conv = payload.setdefault("conversation", {})
         meta = conv.setdefault("meta", {})
-        if channel:
-            # Inject resolved channel so downstream router can dispatch
-            meta["channel"] = channel
-
+        meta["channel"] = channel
+    
         logger.info(
             "[http] Chatwoot webhook accepted: event=%s type=%s channel=%s",
-            event,
-            msg_type,
-            meta.get("channel"),
+            event, msg_type, channel,
         )
-
+    
         if event == "message_created":
-            if msg_type == "incoming":
-                bus.emit("chatwoot.incoming", payload)
-            elif msg_type == "outgoing":
+            # === ВАЖНО: обрабатываем только outgoing ===
+            # Входящие (которые мы же создали через API) не обрабатываем повторно
+            if msg_type == "outgoing":
                 bus.emit("chatwoot.outgoing", payload)
             else:
-                logger.warning("[chatwoot] Unknown message_type: %s", msg_type)
+                logger.debug("[chatwoot] Ignored incoming webhook (created via API)")
         else:
             logger.info("[chatwoot] Ignored event: %s", event)
-
+    
         return {"status": "received"}
 
     @router.post("/vk/callback/{callback_id}", response_class=PlainTextResponse)
@@ -185,5 +180,34 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
 
         # VK requires literal 'ok' to acknowledge processing
         return PlainTextResponse("ok")
+
+    @router.post("/ok/callback/{webhook_id}", response_model=dict)
+    async def ok_webhook(webhook_id: str, request: Request):
+        """Webhook для получения сообщений из Одноклассников."""
+        if not getattr(config, "ok", None):
+            raise HTTPException(status_code=503, detail="OK adapter is not configured")
+
+        # Проверяем webhook_id (защита от случайных запросов)
+        if webhook_id != config.ok.webhook_id:
+            raise HTTPException(status_code=403, detail="Invalid webhook ID")
+
+        try:
+            payload: Dict[str, Any] = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+        webhook_type = payload.get("webhookType")
+        logger.info("[ok] event received: type=%s", webhook_type)
+
+        # Обрабатываем разные типы событий
+        if webhook_type == "MESSAGE_CREATED":
+            bus.emit("ok.incoming", payload)
+        elif webhook_type == "CHAT_SYSTEM":
+            logger.info("[ok] system event: %s", payload.get("type"))
+        else:
+            logger.info("[ok] ignored webhook type: %s", webhook_type)
+
+        # ОК требует ответ 200 OK в течение 5 секунд
+        return {"status": "ok"}
 
     return router

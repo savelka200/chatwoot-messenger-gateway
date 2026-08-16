@@ -23,25 +23,26 @@ class ChatwootService:
         email: Optional[str],
         avatar_url: Optional[str],
         custom_attributes: Dict[str, Any],
-        additional_attributes: Optional[Dict[str, Any]] = None,  # NEW
+        additional_attributes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Upsert contact and return {'id', 'source_id'}.
-        Strategy:
-        - If custom_attributes contain platform user ids (vk_user_id/telegram_user_id), FIRST try /contacts/filter.
-        - Else try /contacts/search with search_key (e.g., phone for WhatsApp).
-        - If found -> update attributes (best effort).
-        - If not found -> create with inbox_id + attributes.
-        """
         contacts = []
-
+    
+        # === Идентификаторы для разных каналов ===
         vk_user_id = (custom_attributes or {}).get("vk_user_id")
+        ok_user_id = (custom_attributes or {}).get("ok_user_id")
+        tg_user_id = (custom_attributes or {}).get("telegram_user_id")
+    
         vk_identifier = f"vk:{vk_user_id}" if vk_user_id else None
-
-        # 1) Attribute-based lookup
+        ok_identifier = f"ok:{ok_user_id}" if ok_user_id else None
+        tg_identifier = f"tg:{tg_user_id}" if tg_user_id else None
+        
+        # Выбираем identifier для текущего канала
+        identifier = ok_identifier or vk_identifier or tg_identifier
+    
+        # 1) Attribute-based lookup через filter_contacts
         attr_lookup_keys = [
             k
-            for k in ("vk_user_id", "telegram_user_id")
+            for k in ("vk_user_id", "telegram_user_id", "ok_user_id")
             if k in (custom_attributes or {})
         ]
         if attr_lookup_keys:
@@ -52,35 +53,43 @@ class ChatwootService:
                 contacts = (res or {}).get("payload") or []
             except Exception as e:
                 logger.warning("[chatwoot] filter_contacts failed: %s", e)
-
-        # 2) Fallback search
+    
+        # 2) Поиск по identifier (надёжный способ)
+        if not contacts and identifier:
+            try:
+                res = await self._client.search_contacts(q=identifier)
+                contacts = (res or {}).get("payload") or []
+                if contacts:
+                    logger.info("[chatwoot] found contact by identifier: %s", identifier)
+            except Exception as e:
+                logger.warning("[chatwoot] search by identifier failed: %s", e)
+    
+        # 3) Fallback: поиск по search_key
         if not contacts:
             try:
                 res = await self._client.search_contacts(q=search_key)
                 contacts = (res or {}).get("payload") or []
             except Exception as e:
                 logger.warning("[chatwoot] search_contacts failed: %s", e)
-
-        # 3) Update or create
+    
+        # 4) Update or create
         if contacts:
             contact = contacts[0]
             contact_id = int(contact.get("id"))
-            # Update attributes only if provided
             if custom_attributes or additional_attributes is not None:
                 try:
                     await self._client.update_contact(
-                        contact_id=contact_id,
-                        name=None,
-                        phone_number=None,
-                        email=None,
-                        identifier=vk_identifier,
-                        custom_attributes=custom_attributes,
-                        additional_attributes=additional_attributes,  # NEW
-                        avatar_url = avatar_url
-                    )
+                    contact_id=contact_id,
+                    name=None,
+                    phone_number=None,
+                    email=None,
+                    identifier=identifier,
+                    custom_attributes=custom_attributes,
+                    additional_attributes=additional_attributes,
+                    avatar_url=avatar_url,
+                )
                 except Exception as e:
                     logger.warning("[chatwoot] update_contact skipped: %s", e)
-            # Optionally set name if empty
             if name and not (contact.get("name") or "").strip():
                 try:
                     await self._client.update_contact(
@@ -95,23 +104,20 @@ class ChatwootService:
                 name=name or search_key,
                 phone_number=phone,
                 email=email,
-                identifier=vk_identifier,
+                identifier=identifier,  # ← СОХРАНЯЕМ identifier
                 custom_attributes=custom_attributes or {},
-                additional_attributes=additional_attributes,  # NEW
-                avatar_url = avatar_url
+                additional_attributes=additional_attributes,
+                avatar_url=avatar_url,
             )
             payload = (created or {}).get("payload") or {}
             contact = payload.get("contact") or created.get("contact") or {}
             if not contact and "id" in (created or {}):
                 contact = created
-
-        # 4) Extract source_id
+    
         source_id = self._extract_source_id_for_inbox(contact, inbox_id) or search_key
         logger.info(
-            "[chatwoot] ensure_contact ok id=%s inbox=%s source_id=%r",
-            contact.get("id"),
-            inbox_id,
-            source_id,
+            "[chatwoot] ensure_contact ok id=%s inbox=%s source_id=%r identifier=%r",
+            contact.get("id"), inbox_id, source_id, identifier,
         )
         return {"id": int(contact.get("id")), "source_id": source_id}
 

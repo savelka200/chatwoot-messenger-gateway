@@ -110,6 +110,12 @@ class MessageRouter:
 
             return None
 
+        if channel == "ok":
+            ok_chat_id = (sender.get("custom_attributes", {}) or {}).get("ok_chat_id")
+            if ok_chat_id and str(ok_chat_id).strip():
+                return str(ok_chat_id).strip()
+            return None
+
         # Other channels: do not guess
         return None
 
@@ -301,7 +307,7 @@ class MessageRouter:
             )
             cw = ChatwootService(client=cw_client)
 
-            error_text = "⚠️ Не удалось отправить некоторые вложения в ВК:\n"
+            error_text = "⚠️ Не удалось отправить некоторые вложения:\n"
             error_text += "\n".join(failed_attachments)
 
             await cw.create_message(
