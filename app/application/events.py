@@ -13,9 +13,15 @@ from app.domain.message import UnifiedMessage, TextContent, MediaContent
 from contextlib import asynccontextmanager
 from app.infra.adapters.ok_bot import OKAdapter
 
+import re
+from urllib.parse import unquote
+
 
 logger = logging.getLogger(__name__)
 MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
+
+
+
 
 def _format_size(size_bytes: int) -> str:
     """Человекочитаемый размер файла."""
@@ -362,49 +368,108 @@ def wire_events(
             sender_raw = payload.get("sender", {}).get("user_id", "")
             chat_id = payload.get("recipient", {}).get("chat_id", "")
             msg = payload.get("message") or {}
-    
+
             # Извлекаем user_id из строки "user:123456789012"
             user_id = sender_raw.split(":")[-1] if ":" in sender_raw else sender_raw
-    
+
             # Парсим текст и вложения
             content, attachments = OKAdapter.parse_ok_media(msg)
-    
+
+            # Карта MIME → расширение для добавления к именам без расширения
+            MIME_TO_EXT = {
+                "application/pdf": "pdf",
+                "application/msword": "doc",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/vnd.ms-excel": "xls",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+                "application/vnd.ms-powerpoint": "ppt",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+                "application/zip": "zip",
+                "application/x-rar-compressed": "rar",
+                "application/x-7z-compressed": "7z",
+                "application/octet-stream": None,  # универсальный, не добавляем
+                "video/mp4": "mp4",
+                "video/webm": "webm",
+                "video/quicktime": "mov",
+                "video/x-msvideo": "avi",
+                "audio/mpeg": "mp3",
+                "audio/ogg": "ogg",
+                "audio/wav": "wav",
+                "audio/x-wav": "wav",
+                "text/plain": "txt",
+            }
+
             # Скачиваем все медиа
             media_files: List[Tuple[str, bytes, str]] = []
             for idx, media in enumerate(attachments):
                 try:
-                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as dl:
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
-                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
-                    media_files.append((media.filename or f"ok_media_{idx}", resp.content, mime))
+
+                        filename = media.filename
+                        mime_from_header = (resp.headers.get("content-type") or "").split(";")[0].strip()
+
+                        # Обогащаем метаданные для документов/видео/аудио
+                        if media.media_type in ("document", "video", "audio"):
+                            # 1. Пытаемся извлечь имя из Content-Disposition
+                            content_disp = resp.headers.get("content-disposition", "")
+                            if content_disp:
+                                # RFC 5987: filename*=UTF-8''%D0%9F%D1%80%D0%B0%D0%BA...
+                                match_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)", content_disp, re.I)
+                                # Обычное: filename="Практика.docx" или filename=Практика.docx
+                                match_plain = re.search(r'filename\s*=\s*"?([^";\s]+)"?', content_disp, re.I)
+
+                                if match_utf8:
+                                    extracted = unquote(match_utf8.group(1).strip())
+                                    filename = extracted
+                                    logger.info("[ok] extracted filename (UTF-8) from headers: %s", filename)
+                                elif match_plain:
+                                    extracted = unquote(match_plain.group(1).strip())
+                                    filename = extracted
+                                    logger.info("[ok] extracted filename from headers: %s", filename)
+
+                            # 2. Если имя не имеет расширения — добавляем по Content-Type
+                            if filename and "." not in filename.rsplit("/", 1)[-1] and mime_from_header:
+                                ext = MIME_TO_EXT.get(mime_from_header)
+                                if ext:
+                                    filename = f"{filename}.{ext}"
+                                    logger.info(
+                                        "[ok] added extension .%s based on Content-Type: %s",
+                                        ext, mime_from_header,
+                                    )
+
+                        mime = mime_from_header or media.mime_type or "application/octet-stream"
+
+                    media_files.append((filename or f"ok_media_{idx}", resp.content, mime))
+
                 except Exception as e:
                     logger.warning("[ok] media download failed (%s): %s", media.url, e)
-    
+
             # Формируем текст
             final_text = ""
             if isinstance(content, TextContent):
                 final_text = content.text.strip()
             if not final_text and media_files:
                 final_text = "Медиа"
-    
+
             # === ПОЛУЧЕНИЕ ПРОФИЛЯ ПОЛЬЗОВАТЕЛЯ ===
             ok_adapter = adapters.get("ok")
             profile = {}
             ok_name = f"OK User {user_id}"
             avatar_url = None
-            
+
             if ok_adapter:
                 # Передаём chat_id для запроса сообщений
                 profile = await ok_adapter.get_user_profile(sender_raw, chat_id)
                 if profile.get("name"):
                     ok_name = profile["name"]
                     logger.info("[ok] got user name from messages: %s", ok_name)
-    
+
             inbox_id = getattr(ok_adapter, "inbox_id", None) if ok_adapter else None
             if not inbox_id:
                 raise RuntimeError("OK inbox_id is not configured")
-    
+
             custom_attributes = {
                 "ok_user_id": sender_raw,
                 "ok_chat_id": chat_id,
@@ -415,7 +480,7 @@ def wire_events(
                     additional_attributes["city"] = profile["city"]
                 if profile.get("birthday"):
                     additional_attributes["birthday"] = profile["birthday"]
-    
+
             ensured = await cw.ensure_contact(
                 inbox_id=inbox_id,
                 search_key=user_id,
@@ -426,13 +491,13 @@ def wire_events(
                 additional_attributes=additional_attributes,
                 avatar_url=avatar_url,
             )
-    
+
             conv_id = await cw.ensure_conversation(
                 inbox_id=inbox_id,
                 contact_id=ensured["id"],
                 source_id=ensured["source_id"],
             )
-    
+
             await cw.create_message(
                 conversation_id=conv_id,
                 content=final_text,
