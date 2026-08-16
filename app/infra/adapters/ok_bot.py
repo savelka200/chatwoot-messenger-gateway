@@ -42,26 +42,26 @@ class OKAdapter(MessengerAdapter):
         """
         Получает информацию о пользователе через последнее сообщение в чате.
         Костыль, потому что прямого метода для профиля нет в Bot API.
-        
+
         Args:
             user_id: ID пользователя в формате "user:123456789012"
             chat_id: ID чата в формате "chat:C3ecb9d02a600"
-        
+
         Returns:
             Dict с полями name, user_id
         """
         if not self._http:
             return {}
-        
+
         try:
             # Запрашиваем последнее сообщение из чата
             url = f"/{chat_id}/messages?access_token={self._config.access_token}&count=1"
             resp = await self._http.get(url)
             resp.raise_for_status()
             data = resp.json()
-            
+
             logger.info("[ok] chat messages response: %s", data)
-            
+
             # Ищем сообщение от нужного пользователя
             messages = data.get("messages", [])
             for msg in messages:
@@ -71,11 +71,11 @@ class OKAdapter(MessengerAdapter):
                         "name": sender.get("name", ""),
                         "user_id": user_id,
                     }
-            
+
             # Если не нашли в последнем сообщении, возвращаем пустой результат
             logger.warning("[ok] user %s not found in last messages of chat %s", user_id, chat_id)
             return {}
-            
+
         except Exception as e:
             logger.warning("[ok] failed to fetch user profile via messages: %s", e)
             return {}
@@ -125,6 +125,63 @@ class OKAdapter(MessengerAdapter):
             resp.raise_for_status()
             return resp.content
 
+    async def get_file_upload_url(self, file_type: str) -> str:
+        """
+        Получает URL для загрузки файла.
+
+        Args:
+            file_type: "IMAGE", "VIDEO", "AUDIO", "FILE"
+
+        Returns:
+            URL для загрузки файла
+        """
+        if not self._http:
+            raise RuntimeError("OK HTTP client is not initialized")
+
+        url = f"/me/fileUploadUrl?access_token={self._config.access_token}&type={file_type}"
+        resp = await self._http.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+        upload_url = data.get("url")
+        if not upload_url:
+            raise RuntimeError(f"No upload URL in response: {data}")
+
+        logger.info("[ok] got upload URL for %s: %s", file_type, upload_url)
+        return upload_url
+
+    async def upload_file(self, upload_url: str, file_bytes: bytes, filename: str, mime_type: str) -> str:
+        """
+        Загружает файл на полученный URL и возвращает токен.
+        ОК возвращает токен в формате: {"photos": {"<id>": {"token": "..."}}}
+        """
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            files = {"file": (filename, file_bytes, mime_type)}
+            resp = await client.post(upload_url, files=files)
+            resp.raise_for_status()
+            data = resp.json()
+    
+            # Токен может быть в разных местах в зависимости от типа файла
+            token = data.get("token")
+            
+            # Для изображений токен находится в photos[id].token
+            if not token:
+                photos = data.get("photos") or {}
+                for photo_id, photo_data in photos.items():
+                    token = photo_data.get("token")
+                    if token:
+                        break
+                    
+            # Для видео/аудио/файлов может быть в других полях
+            if not token:
+                token = data.get("file") or data.get("video", {}).get("token") or data.get("audio", {}).get("token")
+            
+            if not token:
+                raise RuntimeError(f"No token in upload response: {data}")
+    
+            logger.info("[ok] file uploaded, token: %s", token[:50] + "...")
+            return token
+
     async def send_text(self, recipient_id: str, content: TextContent) -> None:
         """Отправляет текстовое сообщение."""
         text = content.text or ""
@@ -149,32 +206,73 @@ class OKAdapter(MessengerAdapter):
         attachments: List[MediaContent],
         reply_to_message_id: Optional[str] = None,
     ) -> List[str]:
-        """Отправляет сообщение в ОК. Пока работает только текст."""
+        """Отправляет сообщение с вложениями в ОК."""
         failed_attachments: List[str] = []
-    
-        # TODO: реализовать загрузку медиа через graph.user.fileUploadUrl
+        attachment_payloads: List[Dict[str, Any]] = []
+
+        # Загружаем каждое вложение
         for media in attachments:
-            logger.warning("[ok] media upload not implemented, skipped: %s", media.filename)
-            failed_attachments.append(f"📎 {media.filename}")
-    
-        # Отправляем текст
+            try:
+                file_bytes = await self._download_file(str(media.url))
+
+                # Определяем тип файла для ОК
+                if media.media_type == "image":
+                    ok_type = "IMAGE"
+                elif media.media_type == "video":
+                    ok_type = "VIDEO"
+                elif media.media_type == "audio":
+                    ok_type = "AUDIO"
+                else:
+                    ok_type = "FILE"
+
+                # Получаем URL загрузки
+                upload_url = await self.get_file_upload_url(ok_type)
+
+                # Загружаем файл
+                token = await self.upload_file(
+                    upload_url,
+                    file_bytes,
+                    media.filename or f"file.{ok_type.lower()}",
+                    media.mime_type or "application/octet-stream",
+                )
+
+                # Добавляем в список аттачментов
+                attachment_payloads.append({
+                    "type": ok_type,
+                    "payload": {"token": token},
+                })
+
+                logger.info("[ok] attachment uploaded: type=%s token=%s", ok_type, token)
+
+            except Exception as e:
+                logger.error("[ok] failed to upload attachment %s: %s", media.url, e)
+                failed_attachments.append(f"📎 {media.filename}")
+
+        # Формируем сообщение
+        message_data: Dict[str, Any] = {}
         if text:
+            message_data["text"] = text
+
+        if attachment_payloads:
+            message_data["attachments"] = attachment_payloads
+
+        # Отправляем сообщение
+        if text or attachment_payloads:
             try:
                 data = {
                     "recipient": {"chat_id": recipient_id},
-                    "message": {"text": text},
+                    "message": message_data,
                 }
                 await self._ok_call("me/messages", data)
                 logger.info(
-                    "[ok] SENT: recipient=%s text=%r attachments_skipped=%d",
-                    recipient_id, text[:50], len(attachments),
+                    "[ok] SENT: recipient=%s text=%r attachments=%d",
+                    recipient_id, (text or "")[:50], len(attachment_payloads),
                 )
             except Exception as e:
-                logger.exception("[ok] Failed to send text to %s: %s", recipient_id, e)
-                # Если не удалось отправить даже текст, добавляем его в failed
-                if not attachments:
-                    failed_attachments.append(f"💬 Текст: {text[:50]}...")
-    
+                logger.exception("[ok] Failed to send message to %s: %s", recipient_id, e)
+                if not attachment_payloads:
+                    failed_attachments.append(f"💬 Текст: {text[:50] if text else 'пусто'}...")
+
         return failed_attachments
 
     @staticmethod

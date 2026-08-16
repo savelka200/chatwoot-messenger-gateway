@@ -307,7 +307,7 @@ class MessageRouter:
             )
             cw = ChatwootService(client=cw_client)
 
-            error_text = "⚠️ Не удалось отправить некоторые вложения в ВК:\n"
+            error_text = "⚠️ Не удалось отправить некоторые вложения:\n"
             error_text += "\n".join(failed_attachments)
 
             await cw.create_message(
