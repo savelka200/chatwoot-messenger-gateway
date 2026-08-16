@@ -401,8 +401,54 @@ def wire_events(
 
             # Скачиваем все медиа
             media_files: List[Tuple[str, bytes, str]] = []
+            video_links_for_text: List[str] = []  # ссылки на плееры, которые не удалось извлечь как файл
+
             for idx, media in enumerate(attachments):
                 try:
+                    # === Специальная обработка для видео ===
+                    if media.media_type == "video":
+                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                            resp = await dl.get(str(media.url))
+                            resp.raise_for_status()
+
+                            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                            logger.info("[ok] video response: content-type=%s, length=%d", content_type, len(resp.content))
+
+                            # Если это HTML-страница (content-type text/html), ищем прямую ссылку
+                            if "text/html" in content_type or "ok.ru/video/" in str(media.url):
+                                html_content = resp.text
+                                direct_url = OKAdapter.extract_direct_video_url(html_content)
+
+                                if direct_url:
+                                    logger.info("[ok] found direct video URL: %s", direct_url[:100])
+                                    # Скачиваем видео по прямой ссылке
+                                    video_resp = await dl.get(direct_url)
+                                    video_resp.raise_for_status()
+
+                                    # Определяем имя и расширение
+                                    video_filename = media.caption or f"ok_video_{idx}.mp4"
+                                    if not video_filename.lower().endswith(".mp4"):
+                                        video_filename += ".mp4"
+
+                                    mime = (video_resp.headers.get("content-type") or "video/mp4").split(";")[0].strip()
+                                    media_files.append((video_filename, video_resp.content, mime))
+                                    logger.info("[ok] video downloaded: %s (%d bytes)", video_filename, len(video_resp.content))
+                                else:
+                                    # Не удалось извлечь прямую ссылку — добавляем ссылку на плеер в текст
+                                    logger.warning("[ok] could not extract direct video URL, adding link to text")
+                                    video_links_for_text.append(
+                                        f"🎬 Видео: {media.caption or 'Без названия'} — {media.url}"
+                                    )
+                            else:
+                                # Это прямой видеофайл — используем как есть
+                                video_filename = media.caption or f"ok_video_{idx}.mp4"
+                                if "." not in video_filename.rsplit("/", 1)[-1]:
+                                    video_filename += ".mp4"
+                                media_files.append((video_filename, resp.content, content_type or "video/mp4"))
+
+                        continue
+                    
+                    # === Обычная обработка для остальных типов (документы, фото, аудио) ===
                     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
@@ -410,34 +456,25 @@ def wire_events(
                         filename = media.filename
                         mime_from_header = (resp.headers.get("content-type") or "").split(";")[0].strip()
 
-                        # Обогащаем метаданные для документов/видео/аудио
-                        if media.media_type in ("document", "video", "audio"):
-                            # 1. Пытаемся извлечь имя из Content-Disposition
+                        if media.media_type in ("document", "audio"):
+                            # Извлекаем имя из Content-Disposition
                             content_disp = resp.headers.get("content-disposition", "")
                             if content_disp:
-                                # RFC 5987: filename*=UTF-8''%D0%9F%D1%80%D0%B0%D0%BA...
                                 match_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)", content_disp, re.I)
-                                # Обычное: filename="Практика.docx" или filename=Практика.docx
                                 match_plain = re.search(r'filename\s*=\s*"?([^";\s]+)"?', content_disp, re.I)
 
                                 if match_utf8:
-                                    extracted = unquote(match_utf8.group(1).strip())
-                                    filename = extracted
-                                    logger.info("[ok] extracted filename (UTF-8) from headers: %s", filename)
+                                    filename = unquote(match_utf8.group(1).strip())
+                                    logger.info("[ok] extracted filename (UTF-8): %s", filename)
                                 elif match_plain:
-                                    extracted = unquote(match_plain.group(1).strip())
-                                    filename = extracted
-                                    logger.info("[ok] extracted filename from headers: %s", filename)
+                                    filename = unquote(match_plain.group(1).strip())
+                                    logger.info("[ok] extracted filename: %s", filename)
 
-                            # 2. Если имя не имеет расширения — добавляем по Content-Type
                             if filename and "." not in filename.rsplit("/", 1)[-1] and mime_from_header:
                                 ext = MIME_TO_EXT.get(mime_from_header)
                                 if ext:
                                     filename = f"{filename}.{ext}"
-                                    logger.info(
-                                        "[ok] added extension .%s based on Content-Type: %s",
-                                        ext, mime_from_header,
-                                    )
+                                    logger.info("[ok] added extension .%s", ext)
 
                         mime = mime_from_header or media.mime_type or "application/octet-stream"
 
@@ -446,12 +483,37 @@ def wire_events(
                 except Exception as e:
                     logger.warning("[ok] media download failed (%s): %s", media.url, e)
 
-            # Формируем текст
-            final_text = ""
+            # === Формирование финального текста ===
+
+            # 1. Базовый текст сообщения от пользователя
+            base_text = ""
             if isinstance(content, TextContent):
-                final_text = content.text.strip()
-            if not final_text and media_files:
+                base_text = content.text.strip()
+
+            # 2. Блок с ссылками на видео (если не удалось скачать)
+            video_block = ""
+            if video_links_for_text:
+                video_block = "📹 Пользователь прислал видео (откройте в ОК)\n"
+
+            # 3. Объединяем
+            if base_text and video_block:
+                final_text = f"{base_text}\n\n{video_block}"
+            elif base_text:
+                final_text = base_text
+            elif video_block:
+                final_text = video_block
+            elif media_files:
                 final_text = "Медиа"
+            else:
+                final_text = ""
+
+            # Логируем, что получилось
+            logger.info(
+                "[ok] final message: text=%r media_files=%d video_links=%d",
+                final_text[:100] if final_text else "",
+                len(media_files),
+                len(video_links_for_text),
+            )
 
             # === ПОЛУЧЕНИЕ ПРОФИЛЯ ПОЛЬЗОВАТЕЛЯ ===
             ok_adapter = adapters.get("ok")

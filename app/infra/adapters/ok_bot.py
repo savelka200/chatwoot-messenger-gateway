@@ -6,6 +6,7 @@ from pyee.asyncio import AsyncIOEventEmitter
 from app.config import OKConfig
 from app.domain.message import TextContent, UnifiedMessage, MediaContent
 from app.domain.ports import MessengerAdapter
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,70 @@ class OKAdapter(MessengerAdapter):
             await self._http.aclose()
             self._http = None
         logger.info("[ok] adapter stopped")
+
+    @staticmethod
+    def extract_direct_video_url(html_content: str) -> Optional[str]:
+        """
+        Пытается извлечь прямую ссылку на видеофайл из HTML страницы ok.ru/video/.
+
+        Ищет в нескольких местах:
+        1. <meta property="og:video" content="...">
+        2. <meta property="og:video:url" content="...">
+        3. JSON с массивом videos внутри <script> тегов (flashvars)
+        4. Любые URL, заканчивающиеся на .mp4 в теле страницы
+        """
+        if not html_content:
+            return None
+
+        # 1. Ищем в Open Graph meta тегах
+        og_patterns = [
+            r'<meta[^>]+property=["\']og:video(?::(?:url|secure_url))?["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::(?:url|secure_url))?["\']',
+        ]
+        for pattern in og_patterns:
+            match = re.search(pattern, html_content, re.I)
+            if match:
+                url = match.group(1)
+                # Декодируем HTML entities
+                url = url.replace("&amp;", "&").replace("&quot;", '"')
+                if url.startswith("http") and any(ext in url.lower() for ext in [".mp4", ".m3u8", "video"]):
+                    return url
+
+        # 2. Ищем JSON с полем "videos" внутри <script> (flashvars)
+        # Обычно в формате: "videos":[{"name":"hd","url":"https://..."}]
+        videos_json_pattern = r'"videos"\s*:\s*\[(\{[^]]+\})\]'
+        match = re.search(videos_json_pattern, html_content)
+        if match:
+            try:
+                import json
+                videos_str = "[" + match.group(1) + "]"
+                # Иногда JSON невалидный из-за экранирования — пробуем парсить
+                videos_str = videos_str.replace('\\"', '"').replace("\\'", "'")
+                videos = json.loads(videos_str)
+                if videos:
+                    # Сортируем по качеству (обычно name: "hd", "sd", "mobile")
+                    # Берём лучшее качество
+                    for priority_name in ["full", "hd", "sd", "low", "mobile"]:
+                        for v in videos:
+                            if v.get("name", "").lower() == priority_name and v.get("url"):
+                                return v["url"]
+                    # Fallback: первое в списке
+                    if videos[0].get("url"):
+                        return videos[0]["url"]
+            except Exception as e:
+                logger.debug("[ok] failed to parse videos JSON: %s", e)
+
+        # 3. Ищем прямые .mp4 URL в теле страницы
+        mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
+        matches = re.findall(mp4_pattern, html_content, re.I)
+        if matches:
+            # Берём первую ссылку
+            url = matches[0]
+            # Обрезаем лишнее в конце
+            url = re.split(r'["\'<>\s]', url)[0]
+            return url
+
+        return None
 
     async def get_user_profile(self, user_id: str, chat_id: str) -> Dict[str, Any]:
         """
