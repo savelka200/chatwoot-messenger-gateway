@@ -10,6 +10,9 @@ from app.config import AppConfig
 from app.infra.chatwoot_client import ChatwootClient
 from app.domain.message import UnifiedMessage, TextContent, MediaContent
 
+from contextlib import asynccontextmanager
+from app.infra.adapters.ok_bot import OKAdapter
+
 
 logger = logging.getLogger(__name__)
 MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
@@ -351,3 +354,94 @@ def wire_events(
             )
         except Exception as e:
             logger.exception("[events] telegram handling failed: %s", e)
+
+    @bus.on("ok.incoming")
+    async def _ingest_ok(payload: Dict[str, Any]) -> None:
+        """Обрабатывает входящее сообщение из Одноклассников."""
+        try:
+            sender_raw = payload.get("sender", {}).get("user_id", "")
+            chat_id = payload.get("recipient", {}).get("chat_id", "")
+            msg = payload.get("message") or {}
+    
+            # Извлекаем user_id из строки "user:123456789012"
+            user_id = sender_raw.split(":")[-1] if ":" in sender_raw else sender_raw
+    
+            # Парсим текст и вложения
+            content, attachments = OKAdapter.parse_ok_media(msg)
+    
+            # Скачиваем все медиа
+            media_files: List[Tuple[str, bytes, str]] = []
+            for idx, media in enumerate(attachments):
+                try:
+                    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as dl:
+                        resp = await dl.get(str(media.url))
+                        resp.raise_for_status()
+                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
+                    media_files.append((media.filename or f"ok_media_{idx}", resp.content, mime))
+                except Exception as e:
+                    logger.warning("[ok] media download failed (%s): %s", media.url, e)
+    
+            # Формируем текст
+            final_text = ""
+            if isinstance(content, TextContent):
+                final_text = content.text.strip()
+            if not final_text and media_files:
+                final_text = "Медиа"
+    
+            # === ПОЛУЧЕНИЕ ПРОФИЛЯ ПОЛЬЗОВАТЕЛЯ ===
+            ok_adapter = adapters.get("ok")
+            profile = {}
+            ok_name = f"OK User {user_id}"
+            avatar_url = None
+            
+            if ok_adapter:
+                # Передаём chat_id для запроса сообщений
+                profile = await ok_adapter.get_user_profile(sender_raw, chat_id)
+                if profile.get("name"):
+                    ok_name = profile["name"]
+                    logger.info("[ok] got user name from messages: %s", ok_name)
+    
+            inbox_id = getattr(ok_adapter, "inbox_id", None) if ok_adapter else None
+            if not inbox_id:
+                raise RuntimeError("OK inbox_id is not configured")
+    
+            custom_attributes = {
+                "ok_user_id": sender_raw,
+                "ok_chat_id": chat_id,
+            }
+            additional_attributes = {}
+            if profile:
+                if profile.get("city"):
+                    additional_attributes["city"] = profile["city"]
+                if profile.get("birthday"):
+                    additional_attributes["birthday"] = profile["birthday"]
+    
+            ensured = await cw.ensure_contact(
+                inbox_id=inbox_id,
+                search_key=user_id,
+                name=ok_name,
+                phone=None,
+                email=None,
+                custom_attributes=custom_attributes,
+                additional_attributes=additional_attributes,
+                avatar_url=avatar_url,
+            )
+    
+            conv_id = await cw.ensure_conversation(
+                inbox_id=inbox_id,
+                contact_id=ensured["id"],
+                source_id=ensured["source_id"],
+            )
+    
+            await cw.create_message(
+                conversation_id=conv_id,
+                content=final_text,
+                direction="incoming",
+                attachments=media_files or None,
+            )
+            logger.info(
+                "[events] ok -> chatwoot OK conv_id=%s inbox=%s name=%s",
+                conv_id, inbox_id, ok_name,
+            )
+        except Exception as e:
+            logger.exception("[events] ok handling failed: %s", e)

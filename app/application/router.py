@@ -110,6 +110,12 @@ class MessageRouter:
 
             return None
 
+        if channel == "ok":
+            ok_chat_id = (sender.get("custom_attributes", {}) or {}).get("ok_chat_id")
+            if ok_chat_id and str(ok_chat_id).strip():
+                return str(ok_chat_id).strip()
+            return None
+
         # Other channels: do not guess
         return None
 
