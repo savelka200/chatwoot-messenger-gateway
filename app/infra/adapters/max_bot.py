@@ -188,27 +188,27 @@ class MaxAdapter(MessengerAdapter):
     ) -> Tuple[Optional[str], List[MediaContent], Optional[str]]:
         """
         Парсит сообщение из webhook MAX.
-        
+
         Returns:
             (text, attachments, reply_to_message_id)
         """
         body = msg.get("body") or {}
         text = (body.get("text") or "").strip()
         message_id = body.get("mid") or msg.get("message_id") or msg.get("id") or "msg"
-        
+
         attachments: List[MediaContent] = []
         # === ВАЖНО: attachments в MAX лежат в body.attachments ===
         attachments_raw = body.get("attachments") or []
-        
+
         logger.info("[max] parsing %d attachments", len(attachments_raw))
-        
+
         for idx, att in enumerate(attachments_raw):
             att_type = att.get("type")
             payload = att.get("payload") or {}
-            
+
             logger.info("[max] attachment %d: type=%s, payload_keys=%s", 
                        idx, att_type, list(payload.keys()))
-            
+
             if att_type == "image":
                 url = payload.get("url")
                 if not url:
@@ -217,7 +217,7 @@ class MaxAdapter(MessengerAdapter):
                 
                 # Имя файла
                 filename = f"max_image_{message_id}_{idx}.jpg"
-                
+
                 attachments.append(
                     MediaContent(
                         type="media",
@@ -228,20 +228,20 @@ class MaxAdapter(MessengerAdapter):
                         raw={"photo_id": payload.get("photo_id")},
                     )
                 )
-            
+
             elif att_type == "video":
                 url = payload.get("url")
                 thumbnail = att.get("thumbnail") or {}
                 thumbnail_url = thumbnail.get("url")
                 duration = att.get("duration")
-                
+
                 if not url:
                     logger.warning("[max] video has no url, skipping")
                     continue
                 
                 # Имя файла
                 filename = f"max_video_{message_id}_{idx}.mp4"
-                
+
                 attachments.append(
                     MediaContent(
                         type="media",
@@ -257,7 +257,7 @@ class MaxAdapter(MessengerAdapter):
                         },
                     )
                 )
-            
+
             elif att_type == "audio":
                 url = payload.get("url")
                 if not url:
@@ -273,31 +273,51 @@ class MaxAdapter(MessengerAdapter):
                         raw={"duration": payload.get("duration")},
                     )
                 )
-            
+
             elif att_type == "file":
                 url = payload.get("url")
                 if not url:
+                    logger.warning("[max] file has no url, skipping")
                     continue
-                name = payload.get("name") or f"file_{idx}"
+                
+                # === ВАЖНО: filename на корневом уровне аттачмента, не в payload! ===
+                filename = att.get("filename") or payload.get("name") or f"file_{idx}"
+                
+                # Получаем размер
+                size = att.get("size") or payload.get("size")
+                
+                # Определяем MIME-тип по расширению, если не указан
+                import mimetypes
+                mime_type = payload.get("mime_type")
+                if not mime_type and filename:
+                    guessed_mime, _ = mimetypes.guess_type(filename)
+                    mime_type = guessed_mime or "application/octet-stream"
+                
+                logger.info("[max] file attachment: filename=%s, size=%s, mime=%s", 
+                        filename, size, mime_type)
+                
                 attachments.append(
                     MediaContent(
                         type="media",
                         media_type="document",
                         url=url,
-                        filename=name,
-                        mime_type=payload.get("mime_type") or "application/octet-stream",
-                        raw={"size": payload.get("size")},
+                        filename=filename,
+                        mime_type=mime_type,
+                        raw={
+                            "size": size,
+                            "fileId": payload.get("fileId"),
+                        },
                     )
-                )
-            
+    )
+
             else:
                 logger.warning("[max] unknown attachment type: %s", att_type)
-        
+
         # Парсим reply (если есть)
         reply_to = msg.get("reply_to")
         if reply_to and isinstance(reply_to, dict):
             reply_to = reply_to.get("message_id")
-        
+
         return text, attachments, reply_to
 
     # === Отправка сообщений ===
