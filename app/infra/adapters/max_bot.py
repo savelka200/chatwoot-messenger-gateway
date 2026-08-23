@@ -141,44 +141,107 @@ class MaxAdapter(MessengerAdapter):
     async def upload_file(self, file_bytes: bytes, filename: str, file_type: str) -> str:
         """
         Загружает файл через POST /uploads.
-        Возвращает токен для использования в сообщении.
-        
-        Args:
-            file_type: "image", "video", "audio", "file"
+
+        Особенности MAX API:
+        - Для image: token приходит в ответе CDN (photos[id].token)
+        - Для video/file/audio: token приходит в ответе /uploads
         """
         if not self._http:
             raise RuntimeError("MAX HTTP client is not initialized")
-        
-        # Шаг 1: Получаем URL загрузки
-        upload_info = await self._api_call(
-            "POST",
-            "/uploads",
-            {"type": file_type},
-        )
-        
+
+        # === Шаг 1: Получаем URL загрузки (type в query-параметрах!) ===
+        logger.info("[max] getting upload URL for type=%s", file_type)
+
+        resp = await self._http.post("/uploads", params={"type": file_type})
+
+        if resp.status_code >= 400:
+            logger.error("[max] upload URL error body: %s", resp.text)
+        resp.raise_for_status()
+
+        upload_info = resp.json()
+        logger.info("[max] upload info: %s", json.dumps(upload_info, ensure_ascii=False)[:500])
+
         upload_url = upload_info.get("url")
         if not upload_url:
             raise RuntimeError(f"No upload URL in response: {upload_info}")
-        
-        # Шаг 2: Загружаем файл (multipart/form-data)
-        async with httpx.AsyncClient(timeout=180.0) as upload_client:
+
+        # Попробуем получить токен из ответа /uploads (для video/file/audio)
+        token = upload_info.get("token")
+        if token:
+            logger.info("[max] token obtained from /uploads response")
+
+        # === Шаг 2: Загружаем файл на CDN ===
+        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as upload_client:
             import mimetypes
             mime_type, _ = mimetypes.guess_type(filename)
             mime_type = mime_type or "application/octet-stream"
-            
-            # Для MAX требуется multipart
-            files = {"data": (filename, file_bytes, mime_type)}
-            resp = await upload_client.post(upload_url, files=files)
-            resp.raise_for_status()
-            
-            upload_result = resp.json()
-        
-        token = upload_result.get("token")
-        if not token:
-            raise RuntimeError(f"No token in upload response: {upload_result}")
-        
-        logger.info("[max] file uploaded (%s), token: %s...", file_type, token[:30])
-        return token
+
+            files = {"file": (filename, file_bytes, mime_type)}
+
+            logger.info(
+                "[max] uploading %s: %s (%d bytes) to CDN",
+                file_type, filename, len(file_bytes),
+            )
+
+            upload_resp = await upload_client.post(upload_url, files=files)
+            upload_resp.raise_for_status()
+
+            # Парсим ответ CDN
+            cdn_data: Dict[str, Any] = {}
+            if upload_resp.text.strip():
+                try:
+                    cdn_data = upload_resp.json()
+                    logger.info("[max] CDN response: %s", json.dumps(cdn_data, ensure_ascii=False)[:500])
+                except Exception:
+                    logger.info("[max] CDN response is not JSON: %s", upload_resp.text[:200])
+            else:
+                logger.info("[max] CDN response is empty (expected for video/file)")
+
+            # === Извлечение токена в зависимости от типа файла ===
+
+            # Для image: токен в cdn_data.photos[id].token
+            if file_type == "image" and not token:
+                photos = cdn_data.get("photos") or {}
+                for photo_id, photo_data in photos.items():
+                    if isinstance(photo_data, dict) and "token" in photo_data:
+                        token = photo_data["token"]
+                        logger.info("[max] token obtained from CDN photos[%s].token", photo_id[:30])
+                        break
+                    
+            # Fallback: пробуем разные варианты извлечения токена из CDN
+            if not token:
+                # Прямое поле token
+                token = cdn_data.get("token")
+
+                # videos[id].token
+                if not token:
+                    for video_data in (cdn_data.get("videos") or {}).values():
+                        if isinstance(video_data, dict) and "token" in video_data:
+                            token = video_data["token"]
+                            break
+                        
+                # files[id].token
+                if not token:
+                    for file_data in (cdn_data.get("files") or {}).values():
+                        if isinstance(file_data, dict) and "token" in file_data:
+                            token = file_data["token"]
+                            break
+                        
+                # audios[id].token
+                if not token:
+                    for audio_data in (cdn_data.get("audios") or {}).values():
+                        if isinstance(audio_data, dict) and "token" in audio_data:
+                            token = audio_data["token"]
+                            break
+                        
+            if not token:
+                raise RuntimeError(
+                    f"No token in upload responses. "
+                    f"upload_info: {upload_info}, cdn_data: {cdn_data}"
+                )
+
+            logger.info("[max] file uploaded (%s), token: %s...", file_type, token[:30])
+            return token
 
     # === Парсер входящих сообщений ===
 
@@ -347,127 +410,193 @@ class MaxAdapter(MessengerAdapter):
         text: str,
         attachments: List[MediaContent],
         reply_to_message_id: Optional[str] = None,
-        recipient_type: str = "chat_id",  # НОВОЕ: "chat_id" или "user_id"
+        recipient_type: str = "chat_id",
     ) -> List[str]:
         """
-        Отправляет сообщение в MAX с вложениями.
-
-        Args:
-            recipient_type: "chat_id" для групповых чатов, "user_id" для диалогов
+        Отправляет сообщение в MAX с учётом ограничений API:
+        - image/video/audio: до 12 в одном сообщении
+        - file: ТОЛЬКО ПО ОДНОМУ на сообщение (с кнопками или без)
+        - После загрузки видео нужна задержка (сервер обрабатывает)
         """
+        import asyncio
+        
         failed_attachments: List[str] = []
-
-        # Группируем медиа
-        media_group: List[MediaContent] = []
-        file_group: List[MediaContent] = []
-
+        
+        # === Группируем вложения ===
+        media_group: List[MediaContent] = []  # image, video, audio — вместе
+        file_group: List[MediaContent] = []   # document — каждое отдельно
+        
         for media in attachments:
             if media.media_type in ("image", "video", "audio"):
                 media_group.append(media)
             else:
                 file_group.append(media)
-
+        
+        # === Формируем список сообщений ===
         messages_to_send: List[Tuple[str, List[MediaContent]]] = []
-
+        
+        # 1. Первое сообщение: текст + медиа (до 12 штук)
         if media_group:
             messages_to_send.append((text or "", media_group[:12]))
+            # Если медиа больше 12 — дробим
             for i in range(12, len(media_group), 12):
                 messages_to_send.append(("", media_group[i:i+12]))
-            text = ""
-
+            text = ""  # текст уже добавлен к первому
+        
+        # 2. Каждое file — отдельное сообщение (требование API)
         for file_media in file_group:
             messages_to_send.append(("", [file_media]))
-
+        
+        # 3. Если нет вложений, но есть текст
         if not messages_to_send and text:
             messages_to_send.append((text, []))
-
+        
         if not messages_to_send:
             return failed_attachments
-
-        logger.info(
-            "[max] plan: %d messages (text=%r, media=%d, files=%d, type=%s)",
-            len(messages_to_send), (text or "")[:30],
-            len(media_group), len(file_group), recipient_type,
+        
+        # Определяем, есть ли в сообщениях видео (нужна задержка)
+        has_video = any(
+            m.media_type == "video"
+            for _, atts in messages_to_send
+            for m in atts
         )
-
+        
+        logger.info(
+            "[max] plan: %d messages (text=%r, media=%d, files=%d, has_video=%s, type=%s)",
+            len(messages_to_send), (text or "")[:30],
+            len(media_group), len(file_group), has_video, recipient_type,
+        )
+        
+        # === Отправляем каждое сообщение ===
         for msg_idx, (msg_text, msg_attachments) in enumerate(messages_to_send):
             try:
+                # Загружаем все вложения
                 attachment_payloads: List[Dict[str, Any]] = []
-
+                has_video_in_this_msg = False
+                
                 for media in msg_attachments:
                     file_bytes = await self._download_file(str(media.url))
-
+                    
                     if media.media_type == "image":
                         max_type = "image"
                     elif media.media_type == "video":
                         max_type = "video"
+                        has_video_in_this_msg = True
                     elif media.media_type == "audio":
                         max_type = "audio"
                     else:
                         max_type = "file"
-
+                    
                     logger.info(
                         "[max] uploading %s: %s (%d bytes)",
                         max_type, media.filename, len(file_bytes),
                     )
-
+                    
                     token = await self.upload_file(
                         file_bytes,
                         media.filename or f"file.{max_type}",
                         max_type,
                     )
-
+                    
                     attachment_payloads.append({
                         "type": max_type,
                         "payload": {"token": token},
                     })
-
+                
                 # Формируем тело сообщения
                 body: Dict[str, Any] = {}
                 if msg_text:
                     body["text"] = msg_text
-                body["format"] = "markdown"
-
-                # === ВАЖНО: user_id/chat_id передаются как query-параметры! ===
+                    body["format"] = "markdown"
+                
+                # Формируем recipient
                 query_params: Dict[str, Any] = {}
                 if recipient_type == "user_id":
                     query_params["user_id"] = int(recipient_id)
                 else:
                     query_params["chat_id"] = int(recipient_id)
-
+                
                 request_data: Dict[str, Any] = dict(body)
-
                 if attachment_payloads:
                     request_data["attachments"] = attachment_payloads
-
-                # Логируем запрос
+                
                 logger.info(
-                    "[max] API POST /messages request: params=%s, body=%s",
+                    "[max] API POST /messages request: params=%s, attachments=%d",
                     json.dumps(query_params, ensure_ascii=False),
-                    json.dumps(request_data, ensure_ascii=False),
+                    len(attachment_payloads),
                 )
-
-                # Отправляем с query-параметрами
-                if not self._http:
-                    raise RuntimeError("MAX HTTP client is not initialized")
-
-                resp = await self._http.post("/messages", params=query_params, json=request_data)
-
-                logger.info("[max] API POST /messages response: status=%d", resp.status_code)
-
-                if resp.status_code >= 400:
-                    error_body = resp.text
-                    logger.error("[max] API error body: %s", error_body)
-
-                resp.raise_for_status()
-
+                
+                # === ВАЖНО: для видео делаем задержку перед отправкой ===
+                # MAX требует время на обработку загруженного видео
+                if has_video_in_this_msg:
+                    # Базовая задержка 3 секунды на обработку
+                    await asyncio.sleep(3.0)
+                
+                # === Отправка с retry на случай "attachment.not.ready" ===
+                max_attempts = 5
+                last_error = None
+                
+                for attempt in range(max_attempts):
+                    try:
+                        if not self._http:
+                            raise RuntimeError("MAX HTTP client is not initialized")
+                        
+                        resp = await self._http.post(
+                            "/messages",
+                            params=query_params,
+                            json=request_data,
+                        )
+                        
+                        logger.info(
+                            "[max] API POST /messages response: status=%d (attempt %d/%d)",
+                            resp.status_code, attempt + 1, max_attempts,
+                        )
+                        
+                        if resp.status_code >= 400:
+                            error_body = resp.text
+                            logger.error("[max] API error body: %s", error_body)
+                            
+                            # Проверяем, это ли ошибка "not ready"
+                            if "not.ready" in error_body or "not.processed" in error_body:
+                                if attempt < max_attempts - 1:
+                                    delay = 3 * (attempt + 1)
+                                    logger.info(
+                                        "[max] attachment not ready, retry in %ds",
+                                        delay,
+                                    )
+                                    await asyncio.sleep(delay)
+                                    continue
+                                
+                            # Другая ошибка — пробрасываем
+                            resp.raise_for_status()
+                        
+                        # Успех
+                        break
+                    
+                    except httpx.HTTPStatusError as e:
+                        error_body = e.response.text
+                        if "not.ready" in error_body or "not.processed" in error_body:
+                            if attempt < max_attempts - 1:
+                                delay = 3 * (attempt + 1)
+                                logger.info(
+                                    "[max] attachment not ready, retry in %ds",
+                                    delay,
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                        raise
+                    
                 logger.info(
                     "[max] SENT message %d/%d: text=%r attachments=%d",
                     msg_idx + 1, len(messages_to_send),
                     msg_text[:30] if msg_text else "",
                     len(attachment_payloads),
                 )
-
+                
+                # Пауза между сообщениями (лимит 2 msg/sec)
+                if msg_idx < len(messages_to_send) - 1:
+                    await asyncio.sleep(0.6)
+            
             except Exception as e:
                 logger.error(
                     "[max] failed to send message %d/%d: %s",
@@ -475,5 +604,5 @@ class MaxAdapter(MessengerAdapter):
                 )
                 for media in msg_attachments:
                     failed_attachments.append(f"📎 {media.filename}")
-
+        
         return failed_attachments

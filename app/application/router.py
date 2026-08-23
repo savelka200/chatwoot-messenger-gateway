@@ -358,17 +358,17 @@ class MessageRouter:
         self,
         conversation_id: int,
         failed_attachments: List[str],
+        channel: str = "",  # ← ОБЯЗАТЕЛЬНО должен быть
     ) -> None:
         """
         Отправляет уведомление оператору в Chatwoot о том,
-        что некоторые вложения не удалось отправить в ВК.
+        что некоторые вложения не удалось отправить в мессенджер.
         """
         try:
-            # Импортируем здесь, чтобы избежать circular import
             from app.application.chatwoot_service import ChatwootService
             from app.infra.chatwoot_client import ChatwootClient
             from app.config import load_config
-
+    
             config = load_config()
             cw_client = ChatwootClient(
                 api_access_token=config.chatwoot.api_access_token,
@@ -376,10 +376,19 @@ class MessageRouter:
                 base_url=str(config.chatwoot.base_url),
             )
             cw = ChatwootService(client=cw_client)
-
-            error_text = "⚠️ Не удалось отправить некоторые вложения:\n"
+    
+            # Название канала для человека
+            channel_name = {
+                "vk": "ВК",
+                "ok": "Одноклассники",
+                "telegram": "Telegram",
+                "whatsapp": "WhatsApp",
+                "max": "MAX",
+            }.get(channel, channel or "мессенджер")
+    
+            error_text = f"⚠️ Не удалось отправить некоторые вложения в {channel_name}:\n"
             error_text += "\n".join(failed_attachments)
-
+    
             await cw.create_message(
                 conversation_id=conversation_id,
                 content=error_text,
@@ -387,8 +396,8 @@ class MessageRouter:
                 private=True,
             )
             logger.warning(
-                "[router] Notified operator about failed attachments: conversation_id=%s count=%d",
-                conversation_id, len(failed_attachments),
+                "[router] Notified operator about failed attachments: conversation_id=%s count=%d channel=%s",
+                conversation_id, len(failed_attachments), channel,
             )
         except Exception as e:
             logger.error("[router] Failed to notify operator about failed attachments: %s", e)
