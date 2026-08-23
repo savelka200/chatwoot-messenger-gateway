@@ -17,6 +17,14 @@ class WasenderWebhookConfig(BaseModel):
     api_key: str
     inbox_id: int  # per-channel inbox
 
+class MaxConfig(BaseModel):
+    access_token: str
+    bot_id: str  # ID бота (получается из GET /me)
+    webhook_secret: str  # секрет для проверки webhook
+    inbox_id: int
+    webhook_id: str = "max"
+    auto_subscribe: bool = True
+
 
 class VKCommunityConfig(BaseModel):
     # VK community configuration for Callback API and sending messages
@@ -49,6 +57,7 @@ class AppConfig(BaseModel):
     vk: Optional[VKCommunityConfig] = None
     chatwoot: ChatwootWebhookConfig
     ok: Optional[OKConfig] = None
+    max: Optional[MaxConfig] = None
     gateway_base_url: Optional[str] = None
 
  
@@ -69,6 +78,7 @@ def _build_channel_map() -> Dict[str, str]:
     t = os.getenv("CHATWOOT_WEBHOOK_ID_TELEGRAM")
     v = os.getenv("CHATWOOT_WEBHOOK_ID_VK")
     o = os.getenv("CHATWOOT_WEBHOOK_ID_OK")
+    m = os.getenv("CHATWOOT_WEBHOOK_ID_MAX")
     if w:
         mapping[w] = "whatsapp"
     if t:
@@ -77,8 +87,9 @@ def _build_channel_map() -> Dict[str, str]:
         mapping[v] = "vk"
     if o:
         mapping[o] = "ok"
+    if m:
+        mapping[m] = "max"
     return mapping
-
 
 def load_config() -> AppConfig:
     try:
@@ -142,11 +153,24 @@ def load_config() -> AppConfig:
                 auto_subscribe=os.getenv("OK_AUTO_SUBSCRIBE", "true").lower() == "true",
             )
 
+        # MAX config
+        max_cfg = None
+        if os.getenv("MAX_ACCESS_TOKEN") and os.getenv("MAX_INBOX_ID"):
+            max_cfg = MaxConfig(
+                access_token=_getenv("MAX_ACCESS_TOKEN"),
+                bot_id=os.getenv("MAX_BOT_ID", ""),  # может быть пустым, получим через /me
+                webhook_secret=_getenv("MAX_WEBHOOK_SECRET"),
+                inbox_id=int(_getenv("MAX_INBOX_ID")),
+                webhook_id=os.getenv("MAX_WEBHOOK_ID") or "max",
+                auto_subscribe=os.getenv("MAX_AUTO_SUBSCRIBE", "true").lower() == "true",
+            )
+
         return AppConfig(
             telegram=telegram_cfg,
             wasender=wasender_cfg,
             vk=vk_cfg,
-            ok=ok_cfg,  # НОВОЕ
+            ok=ok_cfg,
+            max=max_cfg,
             gateway_base_url=os.getenv("GATEWAY_BASE_URL"),  # НОВОЕ
             chatwoot=ChatwootWebhookConfig(
                 api_access_token=_getenv("CHATWOOT_API_ACCESS_TOKEN"),

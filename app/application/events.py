@@ -12,6 +12,7 @@ from app.domain.message import UnifiedMessage, TextContent, MediaContent
 
 from contextlib import asynccontextmanager
 from app.infra.adapters.ok_bot import OKAdapter
+from app.infra.adapters.max_bot import MaxAdapter
 
 import re
 from urllib.parse import unquote
@@ -572,3 +573,167 @@ def wire_events(
             )
         except Exception as e:
             logger.exception("[events] ok handling failed: %s", e)
+
+
+    @bus.on("max.incoming")
+    async def _ingest_max(payload: Dict[str, Any]) -> None:
+        """Обрабатывает входящее сообщение из MAX."""
+        try:
+            # Извлекаем данные
+            message = payload.get("message") or payload
+            sender = message.get("sender", {})
+            recipient = message.get("recipient", {})
+
+            # === ВАЖНО: для диалогов используем sender.user_id как получателя ===
+            chat_type = recipient.get("chat_type", "")
+            chat_id = recipient.get("chat_id")
+            sender_user_id = sender.get("user_id")
+
+            if not sender_user_id:
+                logger.warning("[max] missing sender.user_id")
+                return
+
+            # Для диалогов: получатель = sender (мы отправляем обратно пользователю)
+            # Для групповых чатов: получатель = chat_id
+            if chat_type == "dialog":
+                # В диалоге используем sender.user_id как recipient для отправки
+                max_recipient_id = str(sender_user_id)
+                max_recipient_type = "user_id"
+            else:
+                # В групповом чате используем chat_id
+                if not chat_id:
+                    logger.warning("[max] missing chat_id for group chat")
+                    return
+                max_recipient_id = str(chat_id)
+                max_recipient_type = "chat_id"
+
+            logger.info(
+                "[max] routing: chat_type=%s, recipient_id=%s, recipient_type=%s",
+                chat_type, max_recipient_id, max_recipient_type,
+            )
+
+            # Парсим сообщение
+            text, attachments, reply_to_mid = MaxAdapter.parse_max_message(message)
+
+            # === Обработка reply ===
+            # TODO: для reply нужен маппинг message_id -> max_message_id
+            # Пока пропускаем, можно добавить позже
+
+            # === Скачиваем медиа ===
+            max_adapter = adapters.get("max")
+            media_files: List[Tuple[str, bytes, str]] = []
+            
+            for idx, media in enumerate(attachments):
+                try:
+                    if not max_adapter:
+                        logger.warning("[max] no adapter for download")
+                        continue
+                    
+                    logger.info(
+                        "[max] downloading %s: %s (%s)",
+                        media.media_type, media.filename, media.url[:100],
+                    )
+                    
+                    # Скачиваем с редиректами и увеличенным timeout
+                    # URL видео/фото MAX могут быть на разных CDN
+                    import httpx
+                    async with httpx.AsyncClient(
+                        timeout=60.0,
+                        follow_redirects=True,
+                    ) as download_client:
+                        resp = await download_client.get(str(media.url))
+                        resp.raise_for_status()
+                        
+                        file_bytes = resp.content
+                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0].strip()
+                        
+                        # Проверяем, что скачали реальные данные, а не HTML ошибку
+                        if len(file_bytes) < 100 and b"<html" in file_bytes.lower():
+                            logger.error(
+                                "[max] got HTML instead of media for %s: %s",
+                                media.filename, file_bytes[:200],
+                            )
+                            continue
+                        
+                        logger.info(
+                            "[max] downloaded %s: %d bytes, mime=%s",
+                            media.filename, len(file_bytes), mime,
+                        )
+                        
+                        media_files.append((media.filename or f"max_media_{idx}", file_bytes, mime))
+                
+                except Exception as e:
+                    logger.warning("[max] media download failed for %s: %s", media.filename, e)
+            
+            logger.info("[max] total media files to send: %d", len(media_files))
+
+            # === Получаем имя пользователя прямо из webhook ===
+            max_name = f"MAX User {sender_user_id}"
+            avatar_url = None
+
+            # Извлекаем имя из sender
+            if sender:
+                first_name = sender.get("first_name") or ""
+                last_name = sender.get("last_name") or ""
+                name = sender.get("name") or ""
+                username = sender.get("username") or ""
+
+                if first_name and last_name:
+                    max_name = f"{first_name} {last_name}".strip()
+                elif first_name:
+                    max_name = first_name
+                elif name:
+                    max_name = name
+                elif username:
+                    max_name = username
+
+                # Аватар (если есть в webhook)
+                avatar_url = sender.get("avatar") or sender.get("avatar_url") or sender.get("photo_url")
+
+                logger.info("[max] resolved name: %s", max_name)
+
+            # === Обогащаем контакт ===
+            inbox_id = getattr(max_adapter, "inbox_id", None) if max_adapter else None
+            if not inbox_id:
+                raise RuntimeError("MAX inbox_id not configured")
+
+            # Формируем identifier для поиска (max:{user_id})
+            max_identifier = f"max:{sender_user_id}"
+
+            custom_attributes = {
+                "max_user_id": str(sender_user_id),
+                "max_chat_id": str(chat_id) if chat_id else "",
+                "max_recipient_type": max_recipient_type,
+                "max_recipient_id": max_recipient_id,
+            }
+
+            # Используем max_user_id как search_key
+            ensured = await cw.ensure_contact(
+                inbox_id=inbox_id,
+                search_key=str(sender_user_id),
+                name=max_name,
+                phone=None,
+                email=None,
+                custom_attributes=custom_attributes,
+                avatar_url=avatar_url,
+            )
+
+            conv_id = await cw.ensure_conversation(
+                inbox_id=inbox_id,
+                contact_id=ensured["id"],
+                source_id=ensured["source_id"],
+            )
+
+            await cw.create_message(
+                conversation_id=conv_id,
+                content=text or "",
+                direction="incoming",
+                attachments=media_files or None,
+            )
+
+            logger.info(
+                "[events] max -> chatwoot OK conv_id=%s inbox=%s name=%s",
+                conv_id, inbox_id, max_name,
+            )
+        except Exception as e:
+            logger.exception("[events] max handling failed: %s", e)

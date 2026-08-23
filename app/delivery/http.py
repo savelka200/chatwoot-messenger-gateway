@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict
 
@@ -210,4 +211,35 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         # ОК требует ответ 200 OK в течение 5 секунд
         return {"status": "ok"}
 
+    @router.post("/max/webhook/{webhook_id}", response_model=dict)
+    async def max_webhook(webhook_id: str, request: Request):
+        """Webhook для MAX сообщений."""
+        if not getattr(config, "max", None):
+            raise HTTPException(status_code=503, detail="MAX adapter not configured")
+
+        if webhook_id != config.max.webhook_id:
+            raise HTTPException(status_code=403, detail="Invalid webhook ID")
+
+        try:
+            payload: Dict[str, Any] = await request.json()
+            logger.info("[max] webhook payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+
+        # Проверка подписи (если секрет настроен)
+        # MAX отправляет заголовок X-Max-Signature или проверяет через body
+        # Пока оставляем без проверки (можно добавить позже)
+
+        update_type = payload.get("update_type")
+        logger.info("[max] webhook received: update_type=%s", update_type)
+
+        if update_type == "message_created":
+            bus.emit("max.incoming", payload)
+        else:
+            logger.info("[max] ignored update_type: %s", update_type)
+
+        return {"status": "ok"}
+
     return router
+
+

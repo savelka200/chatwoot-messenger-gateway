@@ -31,18 +31,20 @@ class ChatwootService:
         vk_user_id = (custom_attributes or {}).get("vk_user_id")
         ok_user_id = (custom_attributes or {}).get("ok_user_id")
         tg_user_id = (custom_attributes or {}).get("telegram_user_id")
+        max_user_id = (custom_attributes or {}).get("max_user_id")  # ← НОВОЕ
     
         vk_identifier = f"vk:{vk_user_id}" if vk_user_id else None
         ok_identifier = f"ok:{ok_user_id}" if ok_user_id else None
         tg_identifier = f"tg:{tg_user_id}" if tg_user_id else None
+        max_identifier = f"max:{max_user_id}" if max_user_id else None  # ← НОВОЕ
         
         # Выбираем identifier для текущего канала
-        identifier = ok_identifier or vk_identifier or tg_identifier
+        identifier = max_identifier or ok_identifier or vk_identifier or tg_identifier
     
         # 1) Attribute-based lookup через filter_contacts
         attr_lookup_keys = [
             k
-            for k in ("vk_user_id", "telegram_user_id", "ok_user_id")
+            for k in ("vk_user_id", "telegram_user_id", "ok_user_id", "max_user_id")  # ← ДОБАВЛЕНО
             if k in (custom_attributes or {})
         ]
         if attr_lookup_keys:
