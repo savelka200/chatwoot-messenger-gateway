@@ -116,6 +116,12 @@ class MessageRouter:
                 return str(ok_chat_id).strip()
             return None
 
+        if channel == "max":
+            max_chat_id = (sender.get("custom_attributes", {}) or {}).get("max_chat_id")
+            if max_chat_id and str(max_chat_id).strip():
+                return str(max_chat_id).strip()
+            return None
+
         # Other channels: do not guess
         return None
 
@@ -251,37 +257,101 @@ class MessageRouter:
         )
     
     async def dispatch_outbound(
-        self,
-        channel: str,
-        recipient_id: str,
-        text: str,
-        attachments: List[MediaContent],
-        reply_to_message_id: Optional[str] = None,
-        conversation_id: Optional[int] = None,  # НОВОЕ: для отправки уведомления
-    ) -> None:
+    self,
+    channel: str,
+    recipient_id: str,
+    text: str,
+    attachments: List[MediaContent],
+    reply_to_message_id: Optional[str] = None,
+    conversation_id: Optional[int] = None,
+) -> None:
         adapter = self.adapters.get(channel)
         if not adapter:
             logger.warning("[router] No adapter for channel=%s", channel)
             return
-
+        
+        # === Для MAX: получаем recipient_type из custom_attributes через httpx ===
+        recipient_type = "chat_id"
+        if channel == "max" and conversation_id:
+            try:
+                import httpx
+                from app.config import load_config
+                
+                config = load_config()
+                
+                async with httpx.AsyncClient(
+                    base_url=str(config.chatwoot.base_url),
+                    timeout=10.0,
+                    headers={
+                        "api_access_token": config.chatwoot.api_access_token,
+                        "Content-Type": "application/json",
+                    },
+                ) as client:
+                    account_id = config.chatwoot.account_id
+                    
+                    # Получаем conversation
+                    conv_resp = await client.get(
+                        f"/api/v1/accounts/{account_id}/conversations/{conversation_id}"
+                    )
+                    
+                    if conv_resp.status_code == 200:
+                        conv_data = conv_resp.json()
+                        
+                        # Извлекаем contact_id из meta.sender
+                        sender_info = conv_data.get("meta", {}).get("sender", {})
+                        contact_id = sender_info.get("id")
+                        
+                        if not contact_id:
+                            # Fallback: пробуем другие варианты
+                            contact_id = conv_data.get("contact_id")
+                        
+                        if contact_id:
+                            # Получаем custom_attributes контакта
+                            contact_resp = await client.get(
+                                f"/api/v1/accounts/{account_id}/contacts/{contact_id}"
+                            )
+                            
+                            if contact_resp.status_code == 200:
+                                contact_data = contact_resp.json()
+                                attrs = contact_data.get("custom_attributes", {})
+                                recipient_type = attrs.get("max_recipient_type", "chat_id")
+                                recipient_id = attrs.get("max_recipient_id", recipient_id)
+                                
+                                logger.info(
+                                    "[router] MAX resolved: recipient_id=%s, recipient_type=%s",
+                                    recipient_id, recipient_type,
+                                )
+            
+            except Exception as e:
+                logger.warning("[router] failed to resolve MAX recipient_type: %s", e)
+        
         failed_attachments: List[str] = []
-
+        
         if hasattr(adapter, "send_message"):
-            failed_attachments = await adapter.send_message(
-                recipient_id=recipient_id,
-                text=text,
-                attachments=attachments,
-                reply_to_message_id=reply_to_message_id,
-            )
+            if channel == "max":
+                failed_attachments = await adapter.send_message(
+                    recipient_id=recipient_id,
+                    text=text,
+                    attachments=attachments,
+                    reply_to_message_id=reply_to_message_id,
+                    recipient_type=recipient_type,
+                )
+            else:
+                failed_attachments = await adapter.send_message(
+                    recipient_id=recipient_id,
+                    text=text,
+                    attachments=attachments,
+                    reply_to_message_id=reply_to_message_id,
+                )
         else:
             if text:
                 await adapter.send_text(recipient_id, TextContent(type="text", text=text))
-
-        # === НОВОЕ: отправляем уведомление оператору в Chatwoot ===
+        
         if failed_attachments and conversation_id:
             await self._notify_operator_about_failed_attachments(
                 conversation_id=conversation_id,
                 failed_attachments=failed_attachments,
+                channel=channel,
             )
 
     async def _notify_operator_about_failed_attachments(

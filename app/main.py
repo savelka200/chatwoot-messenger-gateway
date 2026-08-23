@@ -16,6 +16,7 @@ from app.infra.adapters.telegram_telethon import TelegramAdapter
 from app.infra.adapters.vk_bot import VkAdapter
 from app.infra.adapters.whatsapp_wasender import WasenderAdapter
 from app.infra.adapters.ok_bot import OKAdapter
+from app.infra.adapters.max_bot import MaxAdapter
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -43,7 +44,9 @@ if config.vk:
 if config.ok:
     ok_adapter = OKAdapter(bus=bus, config=config.ok)
     adapters["ok"] = ok_adapter
-
+if config.max:
+    max_adapter = MaxAdapter(bus=bus, config=config.max)
+    adapters["max"] = max_adapter
 
 router = MessageRouter(adapters=adapters)
 
@@ -67,6 +70,14 @@ async def lifespan(app: FastAPI):
             success = await ok_adapter.subscribe_to_webhook(webhook_url)
             if not success:
                 logging.warning("[main] OK webhook subscription failed, check manually")
+
+    if config.max and config.max.auto_subscribe:
+        webhook_url = f"{config.gateway_base_url.rstrip('/')}/max/webhook/{config.max.webhook_id}"
+        logging.info("[main] subscribing MAX webhook to: %s", webhook_url)
+        await max_adapter.start()
+        success = await max_adapter.subscribe_webhook(webhook_url)
+        if not success:
+            logging.warning("[main] MAX webhook subscription failed")
 
     # Log here (server process only; avoids duplicate logs from reloader)
     logging.info("adapters configured: %s", list(adapters.keys()))
