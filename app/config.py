@@ -43,6 +43,8 @@ class ChatwootWebhookConfig(BaseModel):
     base_url: HttpUrl
     # Map webhook id -> channel name
     channel_by_webhook_id: Dict[str, str] = Field(default_factory=dict)
+    # webhook_id -> secret
+    secrets_by_webhook_id: Dict[str, str] = Field(default_factory=dict)
 
 class OKConfig(BaseModel):
     access_token: str
@@ -89,6 +91,33 @@ def _build_channel_map() -> Dict[str, str]:
         mapping[o] = "ok"
     if m:
         mapping[m] = "max"
+    return mapping
+
+def _build_secret_map() -> Dict[str, str]:
+    """Build a map from webhook ID to secret."""
+    mapping: Dict[str, str] = {}
+    
+    secrets = {
+        "whatsapp": os.getenv("CHATWOOT_WEBHOOK_SECRET_WHATSAPP"),
+        "telegram": os.getenv("CHATWOOT_WEBHOOK_SECRET_TELEGRAM"),
+        "vk": os.getenv("CHATWOOT_WEBHOOK_SECRET_VK"),
+        "ok": os.getenv("CHATWOOT_WEBHOOK_SECRET_OK"),
+        "max": os.getenv("CHATWOOT_WEBHOOK_SECRET_MAX"),
+    }
+    
+    webhook_ids = {
+        "whatsapp": os.getenv("CHATWOOT_WEBHOOK_ID_WHATSAPP"),
+        "telegram": os.getenv("CHATWOOT_WEBHOOK_ID_TELEGRAM"),
+        "vk": os.getenv("CHATWOOT_WEBHOOK_ID_VK"),
+        "ok": os.getenv("CHATWOOT_WEBHOOK_ID_OK"),
+        "max": os.getenv("CHATWOOT_WEBHOOK_ID_MAX"),
+    }
+    
+    for channel, webhook_id in webhook_ids.items():
+        secret = secrets.get(channel)
+        if webhook_id and secret:
+            mapping[webhook_id] = secret
+    
     return mapping
 
 def load_config() -> AppConfig:
@@ -177,6 +206,7 @@ def load_config() -> AppConfig:
                 account_id=int(_getenv("CHATWOOT_ACCOUNT_ID")),
                 base_url=_getenv("CHATWOOT_BASE_URL"),
                 channel_by_webhook_id=_build_channel_map(),
+                secrets_by_webhook_id=_build_secret_map(),
             ),
         )
 
