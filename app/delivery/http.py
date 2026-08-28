@@ -9,8 +9,85 @@ from starlette.responses import PlainTextResponse
 from app.config import AppConfig
 from app.domain.webhooks.wasender import WasenderWebhookPayload
 
+import hmac
+import hashlib
+import time
+from datetime import datetime
+
 logger = logging.getLogger(__name__)
 
+MAX_TIMESTAMP_AGE_SECONDS = 300  # 5 минут
+
+def verify_chatwoot_signature(
+    *,
+    secret: str,
+    raw_body: bytes,
+    signature_header: str | None,
+    timestamp_header: str | None,
+) -> bool:
+    """
+    Проверяет HMAC-SHA256 подпись webhook от Chatwoot.
+    
+    Формула: sha256=HMAC-SHA256(secret, "{timestamp}.{raw_body}")
+    
+    Args:
+        secret: секрет webhook из Chatwoot
+        raw_body: сырое тело запроса (bytes, не парсится!)
+        signature_header: значение заголовка X-Chatwoot-Signature
+        timestamp_header: значение заголовка X-Chatwoot-Timestamp
+    
+    Returns:
+        True если подпись валидна, False иначе
+    """
+    if not signature_header or not timestamp_header:
+        logger.warning("[chatwoot] Missing signature headers")
+        return False
+    
+    # Проверка timestamp (защита от replay-атак)
+    try:
+        timestamp = int(timestamp_header)
+    except (ValueError, TypeError):
+        logger.warning("[chatwoot] Invalid timestamp: %s", timestamp_header)
+        return False
+    
+    now = int(time.time())
+    age = abs(now - timestamp)
+    if age > MAX_TIMESTAMP_AGE_SECONDS:
+        logger.warning(
+            "[chatwoot] Timestamp too old: %s (age=%ds, max=%ds)",
+            datetime.fromtimestamp(timestamp).isoformat(),
+            age,
+            MAX_TIMESTAMP_AGE_SECONDS,
+        )
+        return False
+    
+    # Проверяем префикс sha256=
+    if not signature_header.startswith("sha256="):
+        logger.warning("[chatwoot] Invalid signature prefix: %s", signature_header[:20])
+        return False
+    
+    received_signature = signature_header[len("sha256="):]
+    
+    # Вычисляем ожидаемую подпись
+    # Важно: используем raw_body как bytes, не парсим JSON!
+    signed_payload = f"{timestamp}.".encode("utf-8") + raw_body
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    
+    # Constant-time comparison (защита от timing attacks)
+    is_valid = hmac.compare_digest(expected_signature, received_signature)
+    
+    if not is_valid:
+        logger.warning(
+            "[chatwoot] Signature mismatch: expected=%s, received=%s",
+            expected_signature[:16] + "...",
+            received_signature[:16] + "...",
+        )
+    
+    return is_valid
 
 def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
     """
@@ -88,35 +165,64 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         return {"status": "ok"}
 
     @router.post("/chatwoot/webhook/{webhook_id}", response_model=dict)
-    async def chatwoot_webhook(webhook_id: str, request: Request):
+    async def chatwoot_webhook(
+        webhook_id: str,
+        request: Request,
+        x_chatwoot_signature: str | None = Header(default=None, alias="X-Chatwoot-Signature"),
+        x_chatwoot_timestamp: str | None = Header(default=None, alias="X-Chatwoot-Timestamp"),
+    ):
         channel = config.chatwoot.channel_by_webhook_id.get(webhook_id)
         if not channel:
             raise HTTPException(status_code=403, detail=f"Unknown webhook ID: {webhook_id}")
-    
-        payload = await request.json()
+        
+        # === ВАЖНО: читаем сырое тело ДО парсинга JSON ===
+        raw_body = await request.body()
+        
+        # === Проверка подписи ===
+        secret = config.chatwoot.secrets_by_webhook_id.get(webhook_id)
+        if secret:
+            if not verify_chatwoot_signature(
+                secret=secret,
+                raw_body=raw_body,
+                signature_header=x_chatwoot_signature,
+                timestamp_header=x_chatwoot_timestamp,
+            ):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        else:
+            # Секрет не настроен — логируем предупреждение, но пропускаем
+            logger.warning(
+                "[chatwoot] No secret configured for webhook_id=%s, skipping signature check",
+                webhook_id,
+            )
+        
+        # Парсим JSON из raw body
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+        
         event = payload.get("event")
         msg_type = payload.get("message_type")
-    
+        
         # Инжектим channel в метаданные
         conv = payload.setdefault("conversation", {})
         meta = conv.setdefault("meta", {})
         meta["channel"] = channel
-    
+        
         logger.info(
             "[http] Chatwoot webhook accepted: event=%s type=%s channel=%s",
             event, msg_type, channel,
         )
-    
+        
         if event == "message_created":
-            # === ВАЖНО: обрабатываем только outgoing ===
-            # Входящие (которые мы же создали через API) не обрабатываем повторно
+            # Обрабатываем только outgoing
             if msg_type == "outgoing":
                 bus.emit("chatwoot.outgoing", payload)
             else:
                 logger.debug("[chatwoot] Ignored incoming webhook (created via API)")
         else:
             logger.info("[chatwoot] Ignored event: %s", event)
-    
+        
         return {"status": "received"}
 
     @router.post("/vk/callback/{callback_id}", response_class=PlainTextResponse)
