@@ -97,35 +97,11 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
 
     @router.get("/health")
     async def health():
-        # Report only non-sensitive fields
-        wasender_enabled = bool(getattr(config, "wasender", None))
-        telegram_enabled = bool(getattr(config, "telegram", None))
-        vk_enabled = bool(getattr(config, "vk", None))
-
         return {
             "ok": True,
-            "chatwoot": {
-                "account_id": config.chatwoot.account_id,
-                "inbox_id": config.chatwoot.inbox_id,
-                "base_url": str(config.chatwoot.base_url),
-                "channels_configured": list(
-                    config.chatwoot.channel_by_webhook_id.values()
-                ),
-            },
-            "wasender": {
-                "enabled": wasender_enabled,
-            },
-            "telegram": {
-                "enabled": telegram_enabled,
-                "session_name": (
-                    config.telegram.session_name if telegram_enabled else None
-                ),
-            },
-            "vk": {
-                "enabled": vk_enabled,
-                # Do not expose callback_id/secret/token; group_id is safe to show
-                "group_id": config.vk.group_id if vk_enabled else None,
-            },
+            "status": "healthy",
+            # Не раскрываем ID аккаунтов и групп
+            "channels_count": len(config.chatwoot.channel_by_webhook_id),
         }
 
     @router.post("/wasender/webhook/{webhook_id}", response_model=dict)
@@ -318,26 +294,59 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         return {"status": "ok"}
 
     @router.post("/max/webhook/{webhook_id}", response_model=dict)
-    async def max_webhook(webhook_id: str, request: Request):
-        """Webhook для MAX сообщений."""
+    async def max_webhook(
+        webhook_id: str,
+        request: Request,
+        x_max_bot_api_secret: str | None = Header(default=None, alias="X-Max-Bot-Api-Secret"),
+    ):
+        """Webhook для MAX сообщений с проверкой секрета."""
         if not getattr(config, "max", None):
             raise HTTPException(status_code=503, detail="MAX adapter not configured")
 
+        # Проверяем webhook_id
         if webhook_id != config.max.webhook_id:
             raise HTTPException(status_code=403, detail="Invalid webhook ID")
 
+        # === Проверка секрета ===
+        if config.max.webhook_secret:
+            if not x_max_bot_api_secret:
+                logger.warning("[max] Missing X-Max-Bot-Api-Secret header")
+                raise HTTPException(status_code=401, detail="Missing secret")
+
+            # Constant-time comparison (защита от timing-атак)
+            if not hmac.compare_digest(config.max.webhook_secret, x_max_bot_api_secret):
+                logger.warning(
+                    "[max] Invalid X-Max-Bot-Api-Secret: expected=%s, received=%s",
+                    config.max.webhook_secret[:8] + "...",
+                    x_max_bot_api_secret[:8] + "...",
+                )
+                raise HTTPException(status_code=401, detail="Invalid secret")
+
+        else:
+            # Секрет не настроен — логируем предупреждение
+            logger.warning(
+                "[max] webhook_secret not configured, skipping signature check for webhook_id=%s",
+                webhook_id,
+            )
+
         try:
             payload: Dict[str, Any] = await request.json()
-            logger.info("[max] webhook payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        # Проверка подписи (если секрет настроен)
-        # MAX отправляет заголовок X-Max-Signature или проверяет через body
-        # Пока оставляем без проверки (можно добавить позже)
-
+        # Логируем только структуру, без полного содержимого (для безопасности)
         update_type = payload.get("update_type")
-        logger.info("[max] webhook received: update_type=%s", update_type)
+        sender_id = payload.get("message", {}).get("sender", {}).get("user_id")
+        chat_id = payload.get("message", {}).get("recipient", {}).get("chat_id")
+
+        logger.info(
+            "[max] webhook received: update_type=%s sender=%s chat=%s",
+            update_type, sender_id, chat_id,
+        )
+
+        # Для отладки можно включить DEBUG уровень
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[max] full payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
 
         if update_type == "message_created":
             bus.emit("max.incoming", payload)
