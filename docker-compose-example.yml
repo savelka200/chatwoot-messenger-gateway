@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  chatwoot-gateway:
+    image: chatwoot-gateway:latest
+    container_name: chatwoot-gateway
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+      - LOG_LEVEL=INFO
+    volumes:
+      - telegram_sessions:/app/sessions
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  telegram_sessions:
+    driver: local
