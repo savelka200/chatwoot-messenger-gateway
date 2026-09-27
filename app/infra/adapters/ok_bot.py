@@ -64,7 +64,9 @@ class OKAdapter(MessengerAdapter):
                 url = match.group(1)
                 # Декодируем HTML entities
                 url = url.replace("&amp;", "&").replace("&quot;", '"')
-                if url.startswith("http") and any(ext in url.lower() for ext in [".mp4", ".m3u8", "video"]):
+                if url.startswith("http") and any(
+                    ext in url.lower() for ext in [".mp4", ".m3u8", "video"]
+                ):
                     return url
 
         # 2. Ищем JSON с полем "videos" внутри <script> (flashvars)
@@ -74,6 +76,7 @@ class OKAdapter(MessengerAdapter):
         if match:
             try:
                 import json
+
                 videos_str = "[" + match.group(1) + "]"
                 # Иногда JSON невалидный из-за экранирования — пробуем парсить
                 videos_str = videos_str.replace('\\"', '"').replace("\\'", "'")
@@ -83,7 +86,9 @@ class OKAdapter(MessengerAdapter):
                     # Берём лучшее качество
                     for priority_name in ["full", "hd", "sd", "low", "mobile"]:
                         for v in videos:
-                            if v.get("name", "").lower() == priority_name and v.get("url"):
+                            if v.get("name", "").lower() == priority_name and v.get(
+                                "url"
+                            ):
                                 return v["url"]
                     # Fallback: первое в списке
                     if videos[0].get("url"):
@@ -120,7 +125,9 @@ class OKAdapter(MessengerAdapter):
 
         try:
             # Запрашиваем последнее сообщение из чата
-            url = f"/{chat_id}/messages?access_token={self._config.access_token}&count=1"
+            url = (
+                f"/{chat_id}/messages?access_token={self._config.access_token}&count=1"
+            )
             resp = await self._http.get(url)
             resp.raise_for_status()
             data = resp.json()
@@ -138,7 +145,9 @@ class OKAdapter(MessengerAdapter):
                     }
 
             # Если не нашли в последнем сообщении, возвращаем пустой результат
-            logger.warning("[ok] user %s not found in last messages of chat %s", user_id, chat_id)
+            logger.warning(
+                "[ok] user %s not found in last messages of chat %s", user_id, chat_id
+            )
             return {}
 
         except Exception as e:
@@ -160,7 +169,7 @@ class OKAdapter(MessengerAdapter):
             )
             resp.raise_for_status()
             data = resp.json()
-            
+
             if data.get("success"):
                 logger.info("[ok] successfully subscribed to webhook: %s", webhook_url)
                 return True
@@ -214,7 +223,9 @@ class OKAdapter(MessengerAdapter):
 
         logger.info(
             "[ok] got upload URL for %s: url=%s, has_token=%s",
-            file_type, upload_url[:80] + "...", bool(token),
+            file_type,
+            upload_url[:80] + "...",
+            bool(token),
         )
 
         return {
@@ -223,7 +234,14 @@ class OKAdapter(MessengerAdapter):
             "file_id": file_id,
         }
 
-    async def upload_file(self, upload_url: str, file_bytes: bytes, filename: str, mime_type: str, file_type: str) -> Optional[str]:
+    async def upload_file(
+        self,
+        upload_url: str,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        file_type: str,
+    ) -> Optional[str]:
         """
         Загружает файл. Для IMAGE возвращает токен из ответа POST.
         Для FILE/VIDEO/AUDIO возвращает None (токен уже получен в get_file_upload_url).
@@ -235,7 +253,9 @@ class OKAdapter(MessengerAdapter):
 
             # Для FILE/VIDEO/AUDIO ответ пустой — это нормально
             if file_type in ("FILE", "VIDEO", "AUDIO"):
-                logger.info("[ok] file uploaded (%s), response is empty (expected)", file_type)
+                logger.info(
+                    "[ok] file uploaded (%s), response is empty (expected)", file_type
+                )
                 return None
 
             # Для IMAGE парсим токен из ответа
@@ -304,7 +324,7 @@ class OKAdapter(MessengerAdapter):
         if images:
             messages_to_send.append((text or "", images[:5]))
             for i in range(5, len(images), 5):
-                messages_to_send.append(("", images[i:i+5]))
+                messages_to_send.append(("", images[i : i + 5]))
             text = ""
 
         for single in singles:
@@ -319,7 +339,10 @@ class OKAdapter(MessengerAdapter):
 
         logger.info(
             "[ok] plan: %d messages (text=%r, images=%d, singles=%d)",
-            len(messages_to_send), (text or "")[:30], len(images), len(singles),
+            len(messages_to_send),
+            (text or "")[:30],
+            len(images),
+            len(singles),
         )
 
         # === Шаг 3: Отправляем каждое сообщение ===
@@ -347,8 +370,11 @@ class OKAdapter(MessengerAdapter):
 
                     logger.info(
                         "[ok] uploading %s: %s (%d bytes) [msg %d/%d]",
-                        ok_type, media.filename, len(file_bytes),
-                        msg_idx + 1, len(messages_to_send),
+                        ok_type,
+                        media.filename,
+                        len(file_bytes),
+                        msg_idx + 1,
+                        len(messages_to_send),
                     )
 
                     upload_info = await self.get_file_upload_url(ok_type)
@@ -367,10 +393,12 @@ class OKAdapter(MessengerAdapter):
                     if not final_token:
                         raise RuntimeError(f"No token available for {ok_type}")
 
-                    attachment_payloads.append({
-                        "type": ok_type,
-                        "payload": {"token": final_token},
-                    })
+                    attachment_payloads.append(
+                        {
+                            "type": ok_type,
+                            "payload": {"token": final_token},
+                        }
+                    )
 
                 # === НОВОЕ: Задержка зависит от типа и размера ===
                 if attachment_payloads:
@@ -385,7 +413,7 @@ class OKAdapter(MessengerAdapter):
                     await asyncio.sleep(delay)
 
                 # Формируем сообщение
-                
+
                 message_data: Dict[str, Any] = {}
 
                 # === НОВОЕ: text всегда должен быть (требование ОК API) ===
@@ -420,8 +448,10 @@ class OKAdapter(MessengerAdapter):
 
                 logger.info(
                     "[ok] SENT message %d/%d: text=%r attachments=%d",
-                    msg_idx + 1, len(messages_to_send),
-                    (msg_text or "")[:30], len(attachment_payloads),
+                    msg_idx + 1,
+                    len(messages_to_send),
+                    (msg_text or "")[:30],
+                    len(attachment_payloads),
                 )
 
                 # Пауза между сообщениями
@@ -431,7 +461,9 @@ class OKAdapter(MessengerAdapter):
             except Exception as e:
                 logger.error(
                     "[ok] failed to send message %d/%d: %s",
-                    msg_idx + 1, len(messages_to_send), e,
+                    msg_idx + 1,
+                    len(messages_to_send),
+                    e,
                 )
                 for media in msg_attachments:
                     failed_attachments.append(f"📎 {media.filename}")
@@ -504,6 +536,7 @@ class OKAdapter(MessengerAdapter):
                 file_name = payload.get("name") or f"file_{payload.get('id', idx)}"
                 # Определяем MIME тип по расширению
                 import mimetypes
+
                 mime_type, _ = mimetypes.guess_type(file_name)
                 mime_type = mime_type or "application/octet-stream"
 
@@ -583,7 +616,9 @@ class OKAdapter(MessengerAdapter):
                 # === НОВОЕ: Логируем полный ответ ===
                 logger.info(
                     "[ok] /me/messages response (attempt %d/%d): %s",
-                    attempt + 1, max_retries, response,
+                    attempt + 1,
+                    max_retries,
+                    response,
                 )
 
                 # Проверяем, что сообщение действительно создано
@@ -599,12 +634,18 @@ class OKAdapter(MessengerAdapter):
                         error_code = response.get("error_code")
                         logger.warning(
                             "[ok] /me/messages returned error: code=%s msg=%s",
-                            error_code, error_msg,
+                            error_code,
+                            error_msg,
                         )
                         # Если видео ещё обрабатывается — повторяем
-                        if "processing" in error_msg.lower() or "not ready" in error_msg.lower():
-                            delay = base_delay * (2 ** attempt)
-                            logger.info("[ok] video still processing, retry in %ss", delay)
+                        if (
+                            "processing" in error_msg.lower()
+                            or "not ready" in error_msg.lower()
+                        ):
+                            delay = base_delay * (2**attempt)
+                            logger.info(
+                                "[ok] video still processing, retry in %ss", delay
+                            )
                             await asyncio.sleep(delay)
                             last_error = error_msg
                             continue
@@ -619,10 +660,14 @@ class OKAdapter(MessengerAdapter):
                 last_error = str(e)
                 logger.warning(
                     "[ok] /me/messages failed (attempt %d/%d): %s",
-                    attempt + 1, max_retries, e,
+                    attempt + 1,
+                    max_retries,
+                    e,
                 )
                 if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
+                    delay = base_delay * (2**attempt)
                     await asyncio.sleep(delay)
 
-        raise RuntimeError(f"Failed to send message after {max_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"Failed to send message after {max_retries} attempts: {last_error}"
+        )

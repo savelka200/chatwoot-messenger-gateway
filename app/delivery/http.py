@@ -268,11 +268,13 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
                 from_id = message.get("from_id")
                 out = message.get("out", 0)
 
-                is_incoming = (out == 0)
+                is_incoming = out == 0
 
                 # Check if we should drop the message
                 # Apply group chat filter ONLY to incoming messages
-                should_drop = is_incoming and peer_id is not None and peer_id >= 2000000000
+                should_drop = (
+                    is_incoming and peer_id is not None and peer_id >= 2000000000
+                )
 
                 if not should_drop:
                     # Emit unified internal event; VkAdapter will convert to UnifiedMessage
