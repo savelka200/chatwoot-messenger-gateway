@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024
 
 
-
-
 def _format_size(size_bytes: int) -> str:
     """Человекочитаемый размер файла."""
     for unit in ("B", "KB", "MB", "GB"):
@@ -149,7 +147,7 @@ def wire_events(
                 # Регистрация для текстовых комментариев
                 if media.media_type == "video":
                     title = (media.caption or "без названия").strip()
-                    video_titles.append(title)          
+                    video_titles.append(title)
 
                 # === Скачивание ===
                 try:
@@ -161,71 +159,123 @@ def wire_events(
                             )
                             logger.info(
                                 "[vk] doc too large (%s bytes), sending link only: %s",
-                                size, media.caption,
+                                size,
+                                media.caption,
                             )
-                            continue            
+                            continue
 
-                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                    async with httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True
+                    ) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
-                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0]
-                    photo_files.append((media.filename or f"vk_media_{idx}", resp.content, mime))           
+                        mime = (
+                            resp.headers.get("content-type")
+                            or media.mime_type
+                            or "application/octet-stream"
+                        ).split(";")[0]
+                    photo_files.append(
+                        (media.filename or f"vk_media_{idx}", resp.content, mime)
+                    )
 
                 except httpx.HTTPStatusError as e:
                     status = e.response.status_code
                     if media.media_type == "video":
-                        logger.info("[vk] video preview not available (status=%s): %s", status, media.caption)
+                        logger.info(
+                            "[vk] video preview not available (status=%s): %s",
+                            status,
+                            media.caption,
+                        )
                     elif media.media_type == "document":
                         doc_mentions.append(f"📎 {media.caption}: {media.url}")
-                        logger.warning("[vk] doc download failed (status=%s), sending link: %s", status, media.caption)
+                        logger.warning(
+                            "[vk] doc download failed (status=%s), sending link: %s",
+                            status,
+                            media.caption,
+                        )
                     elif media.media_type == "audio":
                         duration = (media.raw or {}).get("duration", 0)
-                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
-                        logger.warning("[vk] voice message download failed (status=%s), sending text mention", status)
+                        voice_mentions.append(
+                            f"🎤 Голосовое сообщение ({duration} сек)"
+                        )
+                        logger.warning(
+                            "[vk] voice message download failed (status=%s), sending text mention",
+                            status,
+                        )
                     else:
-                        logger.warning("[vk] media download failed (%s): %s", media.url, e)
+                        logger.warning(
+                            "[vk] media download failed (%s): %s", media.url, e
+                        )
                 except Exception as e:
                     if media.media_type == "document":
                         doc_mentions.append(f"📎 {media.caption}: {media.url}")
-                        logger.warning("[vk] doc download failed, sending link: %s — %s", media.caption, e)
+                        logger.warning(
+                            "[vk] doc download failed, sending link: %s — %s",
+                            media.caption,
+                            e,
+                        )
                     elif media.media_type == "audio":
                         duration = (media.raw or {}).get("duration", 0)
-                        voice_mentions.append(f"🎤 Голосовое сообщение ({duration} сек)")
+                        voice_mentions.append(
+                            f"🎤 Голосовое сообщение ({duration} сек)"
+                        )
                         logger.warning("[vk] voice message download failed: %s", e)
                     else:
-                        logger.warning("[vk] media download failed (%s): %s", media.url, e)         
+                        logger.warning(
+                            "[vk] media download failed (%s): %s", media.url, e
+                        )
 
             # Собираем основной текст сообщения
             text = ""
             if isinstance(umsg.content, TextContent):
                 text = umsg.content.text.strip()
             elif isinstance(umsg.content, MediaContent) and umsg.content.caption:
-                text = umsg.content.caption.strip()         
+                text = umsg.content.caption.strip()
 
-            if not text and photo_files and not video_titles and not doc_mentions and not voice_mentions:
-                text = "Вложения"           
+            if (
+                not text
+                and photo_files
+                and not video_titles
+                and not doc_mentions
+                and not voice_mentions
+            ):
+                text = "Вложения"
 
             # Формируем блоки комментариев
-            comment_blocks: List[str] = []          
+            comment_blocks: List[str] = []
 
             if video_titles:
-                video_block = "🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
+                video_block = (
+                    "🎬 Пользователь отправил видео, посмотрите его через ВК:\n"
+                )
                 video_block += "\n".join(f"  • {title}" for title in video_titles)
-                comment_blocks.append(video_block)          
+                comment_blocks.append(video_block)
 
             if doc_mentions:
                 doc_block = "📎 Документы (ссылки):\n"
                 doc_block += "\n".join(f"  {m}" for m in doc_mentions)
-                comment_blocks.append(doc_block)            
+                comment_blocks.append(doc_block)
 
             if voice_mentions:
                 voice_block = "🎤 Голосовые сообщения (не удалось скачать):\n"
                 voice_block += "\n".join(f"  {m}" for m in voice_mentions)
-                comment_blocks.append(voice_block)          
+                comment_blocks.append(voice_block)
 
             if comment_blocks:
-                text = text + "\n\n" + "\n\n".join(comment_blocks) if text else "\n\n".join(comment_blocks)
+                text = (
+                    text + "\n\n" + "\n\n".join(comment_blocks)
+                    if text
+                    else "\n\n".join(comment_blocks)
+                )
 
+            # For outgoing mirrored messages, prefix the text and ignore comment_blocks formatting
+            is_mirror = getattr(umsg, "event_type", "message_new") == "message_reply"
+            if is_mirror:
+                text = (
+                    f"Из сообщества отправлено сообщение: {text}"
+                    if text
+                    else "Из сообщества отправлено сообщение: Вложения"
+                )
 
             # Обогащение профиля (как было)
             vk_name: Optional[str] = None
@@ -233,16 +283,18 @@ def wire_events(
             additional_attributes: Dict[str, Any] = {}
 
             if config.vk:
+                # If this is a mirrored message from an admin/bot, use peer_id (the user) for the profile fetch
+                fetch_id = peer_id if is_mirror else from_id
                 profile = await _fetch_vk_profile(
                     access_token=config.vk.access_token,
                     api_version=config.vk.api_version,
-                    user_id=from_id,
+                    user_id=fetch_id,
                 )
                 first = (profile.get("first_name") or "").strip()
                 last = (profile.get("last_name") or "").strip()
                 screen_name = (profile.get("screen_name") or "").strip()
                 vk_bdate = (profile.get("bdate") or "").strip() or None
-                photo = (profile.get("photo_200") or "")
+                photo = profile.get("photo_200") or ""
 
                 # Extract city from profile; VK may return dict with "title" or a plain string
                 city_info = profile.get("city")
@@ -276,22 +328,28 @@ def wire_events(
                 email=None,
                 custom_attributes=custom_attributes,
                 additional_attributes=additional_attributes,
-                avatar_url=profile.get("photo_200") if profile else None
+                avatar_url=profile.get("photo_200") if profile else None,
             )
-    
+
             conv_id = await cw.ensure_conversation(
                 inbox_id=inbox_id,
                 contact_id=ensured["id"],
                 source_id=ensured["source_id"],
             )
-    
+
             await cw.create_message(
                 conversation_id=conv_id,
                 content=text,
-                direction="incoming",
+                direction="outgoing" if is_mirror else "incoming",
+                private=is_mirror,
                 attachments=photo_files or None,
             )
-            logger.info("[events] vk -> chatwoot OK conv_id=%s inbox=%s", conv_id, inbox_id)
+            logger.info(
+                "[events] vk -> chatwoot OK conv_id=%s inbox=%s mirror=%s",
+                conv_id,
+                inbox_id,
+                is_mirror,
+            )
         except Exception as e:
             logger.exception("[events] vk handling failed: %s", e)
 
@@ -402,41 +460,77 @@ def wire_events(
 
             # Скачиваем все медиа
             media_files: List[Tuple[str, bytes, str]] = []
-            video_links_for_text: List[str] = []  # ссылки на плееры, которые не удалось извлечь как файл
+            video_links_for_text: List[str] = (
+                []
+            )  # ссылки на плееры, которые не удалось извлечь как файл
 
             for idx, media in enumerate(attachments):
                 try:
                     # === Специальная обработка для видео ===
                     if media.media_type == "video":
-                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                        async with httpx.AsyncClient(
+                            timeout=30.0, follow_redirects=True
+                        ) as dl:
                             resp = await dl.get(str(media.url))
                             resp.raise_for_status()
 
-                            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                            logger.info("[ok] video response: content-type=%s, length=%d", content_type, len(resp.content))
+                            content_type = (
+                                (resp.headers.get("content-type") or "")
+                                .split(";")[0]
+                                .strip()
+                            )
+                            logger.info(
+                                "[ok] video response: content-type=%s, length=%d",
+                                content_type,
+                                len(resp.content),
+                            )
 
                             # Если это HTML-страница (content-type text/html), ищем прямую ссылку
-                            if "text/html" in content_type or "ok.ru/video/" in str(media.url):
+                            if "text/html" in content_type or "ok.ru/video/" in str(
+                                media.url
+                            ):
                                 html_content = resp.text
-                                direct_url = OKAdapter.extract_direct_video_url(html_content)
+                                direct_url = OKAdapter.extract_direct_video_url(
+                                    html_content
+                                )
 
                                 if direct_url:
-                                    logger.info("[ok] found direct video URL: %s", direct_url[:100])
+                                    logger.info(
+                                        "[ok] found direct video URL: %s",
+                                        direct_url[:100],
+                                    )
                                     # Скачиваем видео по прямой ссылке
                                     video_resp = await dl.get(direct_url)
                                     video_resp.raise_for_status()
 
                                     # Определяем имя и расширение
-                                    video_filename = media.caption or f"ok_video_{idx}.mp4"
+                                    video_filename = (
+                                        media.caption or f"ok_video_{idx}.mp4"
+                                    )
                                     if not video_filename.lower().endswith(".mp4"):
                                         video_filename += ".mp4"
 
-                                    mime = (video_resp.headers.get("content-type") or "video/mp4").split(";")[0].strip()
-                                    media_files.append((video_filename, video_resp.content, mime))
-                                    logger.info("[ok] video downloaded: %s (%d bytes)", video_filename, len(video_resp.content))
+                                    mime = (
+                                        (
+                                            video_resp.headers.get("content-type")
+                                            or "video/mp4"
+                                        )
+                                        .split(";")[0]
+                                        .strip()
+                                    )
+                                    media_files.append(
+                                        (video_filename, video_resp.content, mime)
+                                    )
+                                    logger.info(
+                                        "[ok] video downloaded: %s (%d bytes)",
+                                        video_filename,
+                                        len(video_resp.content),
+                                    )
                                 else:
                                     # Не удалось извлечь прямую ссылку — добавляем ссылку на плеер в текст
-                                    logger.warning("[ok] could not extract direct video URL, adding link to text")
+                                    logger.warning(
+                                        "[ok] could not extract direct video URL, adding link to text"
+                                    )
                                     video_links_for_text.append(
                                         f"🎬 Видео: {media.caption or 'Без названия'} — {media.url}"
                                     )
@@ -445,41 +539,71 @@ def wire_events(
                                 video_filename = media.caption or f"ok_video_{idx}.mp4"
                                 if "." not in video_filename.rsplit("/", 1)[-1]:
                                     video_filename += ".mp4"
-                                media_files.append((video_filename, resp.content, content_type or "video/mp4"))
+                                media_files.append(
+                                    (
+                                        video_filename,
+                                        resp.content,
+                                        content_type or "video/mp4",
+                                    )
+                                )
 
                         continue
-                    
+
                     # === Обычная обработка для остальных типов (документы, фото, аудио) ===
-                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as dl:
+                    async with httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True
+                    ) as dl:
                         resp = await dl.get(str(media.url))
                         resp.raise_for_status()
 
                         filename = media.filename
-                        mime_from_header = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                        mime_from_header = (
+                            (resp.headers.get("content-type") or "")
+                            .split(";")[0]
+                            .strip()
+                        )
 
                         if media.media_type in ("document", "audio"):
                             # Извлекаем имя из Content-Disposition
                             content_disp = resp.headers.get("content-disposition", "")
                             if content_disp:
-                                match_utf8 = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)", content_disp, re.I)
-                                match_plain = re.search(r'filename\s*=\s*"?([^";\s]+)"?', content_disp, re.I)
+                                match_utf8 = re.search(
+                                    r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\s]+)",
+                                    content_disp,
+                                    re.I,
+                                )
+                                match_plain = re.search(
+                                    r'filename\s*=\s*"?([^";\s]+)"?', content_disp, re.I
+                                )
 
                                 if match_utf8:
                                     filename = unquote(match_utf8.group(1).strip())
-                                    logger.info("[ok] extracted filename (UTF-8): %s", filename)
+                                    logger.info(
+                                        "[ok] extracted filename (UTF-8): %s", filename
+                                    )
                                 elif match_plain:
                                     filename = unquote(match_plain.group(1).strip())
                                     logger.info("[ok] extracted filename: %s", filename)
 
-                            if filename and "." not in filename.rsplit("/", 1)[-1] and mime_from_header:
+                            if (
+                                filename
+                                and "." not in filename.rsplit("/", 1)[-1]
+                                and mime_from_header
+                            ):
                                 ext = MIME_TO_EXT.get(mime_from_header)
                                 if ext:
                                     filename = f"{filename}.{ext}"
                                     logger.info("[ok] added extension .%s", ext)
 
-                        mime = mime_from_header or media.mime_type or "application/octet-stream"
+                        mime = (
+                            mime_from_header
+                            or media.mime_type
+                            or "application/octet-stream"
+                        )
 
-                    media_files.append((filename or f"ok_media_{idx}", resp.content, mime))
+                    media_files.append(
+                        (filename or f"ok_media_{idx}", resp.content, mime)
+                    )
 
                 except Exception as e:
                     logger.warning("[ok] media download failed (%s): %s", media.url, e)
@@ -569,11 +693,12 @@ def wire_events(
             )
             logger.info(
                 "[events] ok -> chatwoot OK conv_id=%s inbox=%s name=%s",
-                conv_id, inbox_id, ok_name,
+                conv_id,
+                inbox_id,
+                ok_name,
             )
         except Exception as e:
             logger.exception("[events] ok handling failed: %s", e)
-
 
     @bus.on("max.incoming")
     async def _ingest_max(payload: Dict[str, Any]) -> None:
@@ -609,7 +734,9 @@ def wire_events(
 
             logger.info(
                 "[max] routing: chat_type=%s, recipient_id=%s, recipient_type=%s",
-                chat_type, max_recipient_id, max_recipient_type,
+                chat_type,
+                max_recipient_id,
+                max_recipient_type,
             )
 
             # Парсим сообщение
@@ -622,49 +749,67 @@ def wire_events(
             # === Скачиваем медиа ===
             max_adapter = adapters.get("max")
             media_files: List[Tuple[str, bytes, str]] = []
-            
+
             for idx, media in enumerate(attachments):
                 try:
                     if not max_adapter:
                         logger.warning("[max] no adapter for download")
                         continue
-                    
+
                     logger.info(
                         "[max] downloading %s: %s (%s)",
-                        media.media_type, media.filename, media.url[:100],
+                        media.media_type,
+                        media.filename,
+                        media.url[:100],
                     )
-                    
+
                     # Скачиваем с редиректами и увеличенным timeout
                     # URL видео/фото MAX могут быть на разных CDN
                     import httpx
+
                     async with httpx.AsyncClient(
                         timeout=60.0,
                         follow_redirects=True,
                     ) as download_client:
                         resp = await download_client.get(str(media.url))
                         resp.raise_for_status()
-                        
+
                         file_bytes = resp.content
-                        mime = (resp.headers.get("content-type") or media.mime_type or "application/octet-stream").split(";")[0].strip()
-                        
+                        mime = (
+                            (
+                                resp.headers.get("content-type")
+                                or media.mime_type
+                                or "application/octet-stream"
+                            )
+                            .split(";")[0]
+                            .strip()
+                        )
+
                         # Проверяем, что скачали реальные данные, а не HTML ошибку
                         if len(file_bytes) < 100 and b"<html" in file_bytes.lower():
                             logger.error(
                                 "[max] got HTML instead of media for %s: %s",
-                                media.filename, file_bytes[:200],
+                                media.filename,
+                                file_bytes[:200],
                             )
                             continue
-                        
+
                         logger.info(
                             "[max] downloaded %s: %d bytes, mime=%s",
-                            media.filename, len(file_bytes), mime,
+                            media.filename,
+                            len(file_bytes),
+                            mime,
                         )
-                        
-                        media_files.append((media.filename or f"max_media_{idx}", file_bytes, mime))
-                
+
+                        media_files.append(
+                            (media.filename or f"max_media_{idx}", file_bytes, mime)
+                        )
+
                 except Exception as e:
-                    logger.warning("[max] media download failed for %s: %s", media.filename, e)
-            
+                    logger.warning(
+                        "[max] media download failed for %s: %s", media.filename, e
+                    )
+
             logger.info("[max] total media files to send: %d", len(media_files))
 
             # === Получаем имя пользователя прямо из webhook ===
@@ -688,7 +833,11 @@ def wire_events(
                     max_name = username
 
                 # Аватар (если есть в webhook)
-                avatar_url = sender.get("avatar") or sender.get("avatar_url") or sender.get("photo_url")
+                avatar_url = (
+                    sender.get("avatar")
+                    or sender.get("avatar_url")
+                    or sender.get("photo_url")
+                )
 
                 logger.info("[max] resolved name: %s", max_name)
 
@@ -733,7 +882,9 @@ def wire_events(
 
             logger.info(
                 "[events] max -> chatwoot OK conv_id=%s inbox=%s name=%s",
-                conv_id, inbox_id, max_name,
+                conv_id,
+                inbox_id,
+                max_name,
             )
         except Exception as e:
             logger.exception("[events] max handling failed: %s", e)

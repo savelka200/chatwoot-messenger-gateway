@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union, List
 import mimetypes
 import httpx  # NEW
@@ -10,6 +11,32 @@ from app.domain.message import TextContent, UnifiedMessage, MediaContent
 from app.domain.ports import MessengerAdapter, OnMessage
 
 logger = logging.getLogger(__name__)
+
+
+class DeduplicationCache:
+    """Simple TTL cache for generated random_id to prevent mirroring self-sent messages."""
+
+    def __init__(self, ttl: int = 60):
+        self._cache: Dict[int, float] = {}
+        self.ttl = ttl
+
+    def _cleanup(self) -> None:
+        now = time.monotonic()
+        # Create a list of keys to delete to avoid dictionary size changing during iteration
+        to_delete = [k for k, v in self._cache.items() if now - v > self.ttl]
+        for k in to_delete:
+            del self._cache[k]
+
+    def add(self, key: int) -> None:
+        self._cleanup()
+        self._cache[key] = time.monotonic()
+
+    def contains(self, key: int) -> bool:
+        self._cleanup()
+        if key in self._cache:
+            del self._cache[key]
+            return True
+        return False
 
 
 class VkAdapter(MessengerAdapter):
@@ -23,7 +50,7 @@ class VkAdapter(MessengerAdapter):
         self._incoming_listener: Optional[Callable[..., Awaitable[None]]] = None
         self._confirm_listener: Optional[Callable[..., Awaitable[None]]] = None
         self._http: Optional[httpx.AsyncClient] = None  # NEW
-
+        self._dedup_cache = DeduplicationCache(ttl=60)
 
     async def _download_file(self, url: str) -> bytes:
         """Скачивает файл по URL."""
@@ -32,7 +59,9 @@ class VkAdapter(MessengerAdapter):
             resp.raise_for_status()
             return resp.content
 
-    async def send_photo(self, peer_id: int, photo_bytes: bytes, filename: str = "photo.jpg") -> str:
+    async def send_photo(
+        self, peer_id: int, photo_bytes: bytes, filename: str = "photo.jpg"
+    ) -> str:
         """
         Загружает фото в ВК и возвращает строку 'photo<owner_id>_<photo_id>'.
         Используется для параметра attachment в messages.send.
@@ -46,14 +75,18 @@ class VkAdapter(MessengerAdapter):
         )
         upload_url = upload_server.get("upload_url")
         if not upload_url:
-            raise RuntimeError("No upload_url in photos.getMessagesUploadServer response")
+            raise RuntimeError(
+                "No upload_url in photos.getMessagesUploadServer response"
+            )
 
         # Шаг 2: Загрузить файл на сервер ВК (абсолютный URL, не через _vk_call)
         async with httpx.AsyncClient(timeout=60.0) as upload_client:
             files = {"photo": (filename, photo_bytes, "image/jpeg")}
             resp = await upload_client.post(upload_url, files=files)
             resp.raise_for_status()
-            upload_result = resp.json()  # {"server": N, "photo": "[...]", "hash": "..."}
+            upload_result = (
+                resp.json()
+            )  # {"server": N, "photo": "[...]", "hash": "..."}
 
         # Шаг 3: Сохранить фото
         saved = await self._vk_call("photos.saveMessagesPhoto", upload_result)
@@ -103,7 +136,7 @@ class VkAdapter(MessengerAdapter):
             {
                 "peer_id": peer_id,
                 "type": doc_type,
-            }
+            },
         )
         upload_url = upload_server.get("upload_url")
         if not upload_url:
@@ -114,6 +147,7 @@ class VkAdapter(MessengerAdapter):
         async with httpx.AsyncClient(timeout=120.0) as upload_client:
             # Определяем MIME по расширению
             import mimetypes
+
             mime_type, _ = mimetypes.guess_type(filename)
             mime_type = mime_type or "application/octet-stream"
 
@@ -132,7 +166,7 @@ class VkAdapter(MessengerAdapter):
             {
                 "file": file_hash,
                 "title": filename,  # ВК использует это как отображаемое имя
-            }
+            },
         )
 
         # Ответ может быть {"type": "doc", "doc": {...}} или {"type": "audio_message", "audio_message": {...}}
@@ -202,9 +236,10 @@ class VkAdapter(MessengerAdapter):
             quote_lines.extend(attachment_descriptions)
 
         return "\n".join(quote_lines)
+
     @staticmethod
     def extract_vk_photo_url(photo: Dict[str, Any]) -> Optional[str]:
-        #orig_photo → самый крупный size
+        # orig_photo → самый крупный size
         orig_url = (photo.get("orig_photo") or {}).get("url")
         if orig_url:
             return orig_url
@@ -213,7 +248,6 @@ class VkAdapter(MessengerAdapter):
             return None
         best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
         return best.get("url")
-
 
     @classmethod
     def parse_vk_media(
@@ -224,11 +258,11 @@ class VkAdapter(MessengerAdapter):
         Поддерживает: фото, видео (превью), документы, голосовые сообщения.
         """
         text = (msg.get("text") or "").strip()
-        message_id = str(msg.get("id")) if msg.get("id") is not None else "msg" 
+        message_id = str(msg.get("id")) if msg.get("id") is not None else "msg"
 
         attachments: List[MediaContent] = []
         for idx, att in enumerate(msg.get("attachments") or []):
-            att_type = att.get("type")  
+            att_type = att.get("type")
 
             if att_type == "photo":
                 photo = att.get("photo") or {}
@@ -245,7 +279,7 @@ class VkAdapter(MessengerAdapter):
                         filename=f"vk_{message_id}_{idx}.jpg",
                         mime_type="image/jpeg",
                     )
-                )   
+                )
 
             elif att_type == "video":
                 video = att.get("video") or {}
@@ -269,7 +303,7 @@ class VkAdapter(MessengerAdapter):
                         filename=f"vk_{message_id}_{idx}_video_preview.jpg",
                         mime_type="image/jpeg",
                     )
-                )   
+                )
 
             elif att_type == "doc":
                 doc = att.get("doc") or {}
@@ -297,7 +331,7 @@ class VkAdapter(MessengerAdapter):
                         mime_type=mime_type,
                         raw={"size": size} if size else {},
                     )
-                )   
+                )
 
             elif att_type == "audio_message":
                 audio_msg = att.get("audio_message") or {}
@@ -315,16 +349,19 @@ class VkAdapter(MessengerAdapter):
                         url=audio_url,
                         caption=f"Голосовое сообщение ({duration} сек)",
                         filename=filename,
-                        mime_type="audio/mpeg" if audio_url.endswith(".mp3") else "audio/ogg",
+                        mime_type=(
+                            "audio/mpeg" if audio_url.endswith(".mp3") else "audio/ogg"
+                        ),
                         raw={"duration": duration},
                     )
-                )   
+                )
 
         if not attachments:
-            return TextContent(type="text", text=text), []  
+            return TextContent(type="text", text=text), []
 
         primary: Union[TextContent, MediaContent] = TextContent(type="text", text=text)
         return primary, attachments
+
     @classmethod
     def _build_content(cls, msg, *_args):
         return cls.parse_vk_media(msg)
@@ -345,26 +382,39 @@ class VkAdapter(MessengerAdapter):
             )
 
         async def _on_vk_incoming(payload: Dict[str, Any]) -> None:
-            if payload.get("event") != "message_new":
+            event_type = payload.get("event")
+            if event_type not in ("message_new", "message_reply"):
                 return
-        
+
             msg = payload.get("message") or {}
+
+            # Deduplication check for message_reply
+            if event_type == "message_reply":
+                random_id = msg.get("random_id")
+                if random_id and self._dedup_cache.contains(random_id):
+                    logger.debug(
+                        "[vk] Ignoring self-sent message_reply (random_id=%s)",
+                        random_id,
+                    )
+                    return
+
             peer_id = msg.get("peer_id")
             from_id = msg.get("from_id") or peer_id
             message_id = msg.get("id")
             conversation_message_id = msg.get("conversation_message_id")
-        
+
             if not peer_id:
                 logger.debug("[vk] skip incoming: missing peer_id")
                 return
-        
+
             # === ПРОВЕРКА НА is_cropped ===
             # ВК присылает is_cropped=true, если в webhook влезли не все вложения
             is_cropped = bool(msg.get("is_cropped"))
             if is_cropped and conversation_message_id is not None:
                 logger.info(
                     "[vk] is_cropped=true detected, fetching full message (peer=%s, cmid=%s)",
-                    peer_id, conversation_message_id,
+                    peer_id,
+                    conversation_message_id,
                 )
                 full_msg = await self._fetch_full_message(
                     peer_id=int(peer_id),
@@ -378,12 +428,12 @@ class VkAdapter(MessengerAdapter):
                     )
                 else:
                     logger.warning("[vk] fallback to cropped payload")
-        
+
             # Обновляем ID из (возможно, полного) msg
             from_id = str(msg.get("from_id") or peer_id)
             peer_id_str = str(peer_id)
             message_id = str(msg.get("id")) if msg.get("id") is not None else None
-        
+
             content, attachments = self._build_content(msg)
 
             reply_msg = msg.get("reply_message")
@@ -395,7 +445,11 @@ class VkAdapter(MessengerAdapter):
                 if isinstance(content, TextContent):
                     # Если основной контент — текст, добавляем цитату в начало
                     original_text = content.text.strip()
-                    new_text = f"{reply_quote}\n\n{original_text}" if original_text else reply_quote
+                    new_text = (
+                        f"{reply_quote}\n\n{original_text}"
+                        if original_text
+                        else reply_quote
+                    )
                     content = TextContent(type="text", text=new_text)
                 elif isinstance(content, MediaContent):
                     # Если основной контент — медиа (одно фото без текста),
@@ -412,15 +466,20 @@ class VkAdapter(MessengerAdapter):
                 attachments=attachments,
                 raw=payload,  # оригинал сохраняем для отладки
             )
+
+            # Monkey-patch event_type to distinguish message_reply in ChatwootService
+            umsg.event_type = event_type
+
             self._bus.emit("vk.message", umsg)
 
         async def _on_vk_confirmation(payload: Dict[str, Any]) -> None:
             group_id = payload.get("group_id")
-            logger.info("[vk] confirmation request received for group_id=%s", group_id) 
+            logger.info("[vk] confirmation request received for group_id=%s", group_id)
+
         self._incoming_listener = _on_vk_incoming
         self._confirm_listener = _on_vk_confirmation
         self._bus.on("vk.incoming", self._incoming_listener)
-        self._bus.on("vk.confirmation", self._confirm_listener) 
+        self._bus.on("vk.confirmation", self._confirm_listener)
         logger.info("[vk] adapter started (callback API, text only)")
 
     async def stop(self) -> None:
@@ -474,7 +533,9 @@ class VkAdapter(MessengerAdapter):
         except Exception as e:
             logger.warning(
                 "[vk] failed to fetch full message (peer=%s, cmid=%s): %s",
-                peer_id, conversation_message_id, e,
+                peer_id,
+                conversation_message_id,
+                e,
             )
             return None
 
@@ -513,6 +574,7 @@ class VkAdapter(MessengerAdapter):
 
         try:
             random_id = secrets.randbits(31)  # unique random_id per request
+            self._dedup_cache.add(random_id)
             params = {
                 "peer_id": int(recipient_id),
                 "message": text,
@@ -541,12 +603,12 @@ class VkAdapter(MessengerAdapter):
         peer_id = int(recipient_id)
         attachment_strings: List[str] = []
         failed_attachments: List[str] = []
-    
+
         # Загружаем каждое вложение
         for media in attachments:
             try:
                 file_bytes = await self._download_file(str(media.url))
-    
+
                 if media.media_type == "image":
                     att = await self.send_photo(
                         peer_id,
@@ -554,7 +616,7 @@ class VkAdapter(MessengerAdapter):
                         media.filename or "photo.jpg",
                     )
                     attachment_strings.append(att)
-    
+
                 elif media.media_type == "document":
                     filename = media.filename or "document.bin"
                     att = await self.send_document(
@@ -564,16 +626,22 @@ class VkAdapter(MessengerAdapter):
                         doc_type="doc",
                     )
                     attachment_strings.append(att)
-    
+
                 elif media.media_type == "audio":
-                    logger.warning("[vk] audio messages not yet supported for outgoing, skipped: %s", media.filename)
-                    failed_attachments.append(f"🎵 {media.filename} (аудио пока не поддерживается)")
-    
+                    logger.warning(
+                        "[vk] audio messages not yet supported for outgoing, skipped: %s",
+                        media.filename,
+                    )
+                    failed_attachments.append(
+                        f"🎵 {media.filename} (аудио пока не поддерживается)"
+                    )
+
                 elif media.media_type == "video":
                     filename = media.filename or "video.mp4"
                     logger.info(
                         "[vk] uploading video as document: %s (%d bytes)",
-                        filename, len(file_bytes),
+                        filename,
+                        len(file_bytes),
                     )
                     att = await self.send_document(
                         peer_id,
@@ -584,18 +652,24 @@ class VkAdapter(MessengerAdapter):
                     attachment_strings.append(att)
 
                 else:
-                    logger.warning("[vk] unknown media_type=%s, skipped: %s", media.media_type, media.filename)
+                    logger.warning(
+                        "[vk] unknown media_type=%s, skipped: %s",
+                        media.media_type,
+                        media.filename,
+                    )
                     failed_attachments.append(f"📎 {media.filename} (неизвестный тип)")
-    
+
             except Exception as e:
                 logger.error("[vk] failed to upload attachment %s: %s", media.url, e)
                 # === ИСПРАВЛЕНО: добавляем в список ошибок ===
                 failed_attachments.append(f"📎 {media.filename}")
-    
+
         # Формируем параметры messages.send
+        random_id = secrets.randbits(31)
+        self._dedup_cache.add(random_id)
         params: Dict[str, Any] = {
             "peer_id": peer_id,
-            "random_id": secrets.randbits(31),
+            "random_id": random_id,
         }
         if text:
             params["message"] = text
@@ -603,17 +677,21 @@ class VkAdapter(MessengerAdapter):
             params["attachment"] = ",".join(attachment_strings)
         if reply_to_message_id:
             params["reply_to"] = int(reply_to_message_id)
-    
+
         # Отправляем основное сообщение
         if text or attachment_strings:
             try:
                 res = await self._vk_call("messages.send", params)
                 logger.info(
                     "[vk] SENT: peer_id=%s text=%r attachments=%d reply=%s result=%s",
-                    peer_id, (text or "")[:50], len(attachment_strings), reply_to_message_id, res,
+                    peer_id,
+                    (text or "")[:50],
+                    len(attachment_strings),
+                    reply_to_message_id,
+                    res,
                 )
             except Exception as e:
                 logger.exception("[vk] Failed to send message to %s: %s", peer_id, e)
-    
+
         # Возвращаем список ошибок для уведомления оператора
         return failed_attachments

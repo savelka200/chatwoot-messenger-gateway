@@ -57,6 +57,7 @@ class UnifiedMessage(BaseModel):
     channel: Literal["whatsapp", "telegram", "vk"]
     recipient_id: str
     sender_id: str | None = None
+    event_type: str = "message_new"
     sender_name: str | None = None
     content: Content
     attachments: List[MediaContent] = []

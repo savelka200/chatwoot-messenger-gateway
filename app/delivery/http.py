@@ -254,10 +254,17 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         if group_id != config.vk.group_id:
             raise HTTPException(status_code=400, detail="Invalid group_id")
 
-        if event_type == "message_new":
+        if event_type in ("message_new", "message_reply"):
             try:
                 obj = payload.get("object") or {}
-                message = obj.get("message") or {}
+                # In message_reply, the object is the message itself, or sometimes wrapped.
+                # Documentation says message_new has "message" inside "object".
+                # message_reply has the same structure or direct. Let's check both.
+                if "message" in obj:
+                    message = obj.get("message") or {}
+                else:
+                    message = obj
+
                 peer_id = message.get("peer_id")
                 from_id = message.get("from_id")
 
@@ -273,17 +280,18 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
                     # Emit unified internal event; VkAdapter will convert to UnifiedMessage
                     bus.emit(
                         "vk.incoming",
-                        {"event": "message_new", "message": message, "raw": payload},
+                        {"event": event_type, "message": message, "raw": payload},
                     )
                 else:
                     logger.info(
-                        "[vk] ignoring message_new from group chat or non-private chat (peer_id=%s, from_id=%s)",
+                        "[vk] ignoring %s from group chat or non-private chat (peer_id=%s, from_id=%s)",
+                        event_type,
                         peer_id,
                         from_id,
                     )
             except Exception as e:
                 raise HTTPException(
-                    status_code=400, detail=f"Invalid message_new payload: {e}"
+                    status_code=400, detail=f"Invalid {event_type} payload: {e}"
                 )
         else:
             # Acknowledge other events to prevent VK retries
