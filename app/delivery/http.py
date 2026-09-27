@@ -254,36 +254,44 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         if group_id != config.vk.group_id:
             raise HTTPException(status_code=400, detail="Invalid group_id")
 
-        if event_type == "message_new":
+        if event_type in ("message_new", "message_reply"):
             try:
                 obj = payload.get("object") or {}
                 message = obj.get("message") or {}
+                if event_type == "message_reply":
+                    message = obj
                 peer_id = message.get("peer_id")
                 from_id = message.get("from_id")
+                out = message.get("out")
 
-                # Check if it's a private chat
-                is_private_chat = (
-                    peer_id is not None
-                    and from_id is not None
-                    and peer_id == from_id
-                    and 0 < peer_id < 2000000000
-                )
-
-                if is_private_chat:
-                    # Emit unified internal event; VkAdapter will convert to UnifiedMessage
-                    bus.emit(
-                        "vk.incoming",
-                        {"event": "message_new", "message": message, "raw": payload},
-                    )
+                # Ignore outgoing messages (including message_reply which usually is outgoing)
+                if out == 1:
+                    logger.info("[vk] ignoring outgoing message (out=1)")
                 else:
-                    logger.info(
-                        "[vk] ignoring message_new from group chat or non-private chat (peer_id=%s, from_id=%s)",
-                        peer_id,
-                        from_id,
+                    # Check if it's a private chat
+                    is_private_chat = (
+                        peer_id is not None
+                        and from_id is not None
+                        and peer_id == from_id
+                        and 0 < peer_id < 2000000000
                     )
+
+                    if is_private_chat:
+                        # Emit unified internal event; VkAdapter will convert to UnifiedMessage
+                        bus.emit(
+                            "vk.incoming",
+                            {"event": "message_new", "message": message, "raw": payload},
+                        )
+                    else:
+                        logger.info(
+                            "[vk] ignoring %s from group chat or non-private chat (peer_id=%s, from_id=%s)",
+                            event_type,
+                            peer_id,
+                            from_id,
+                        )
             except Exception as e:
                 raise HTTPException(
-                    status_code=400, detail=f"Invalid message_new payload: {e}"
+                    status_code=400, detail=f"Invalid {event_type} payload: {e}"
                 )
         else:
             # Acknowledge other events to prevent VK retries
