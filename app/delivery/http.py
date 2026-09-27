@@ -257,26 +257,24 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         if event_type in ("message_new", "message_reply"):
             try:
                 obj = payload.get("object") or {}
-                # In message_reply, the object is the message itself, or sometimes wrapped.
-                # Documentation says message_new has "message" inside "object".
-                # message_reply has the same structure or direct. Let's check both.
-                if "message" in obj:
+                # In message_new, the actual payload is wrapped inside "message".
+                # In message_reply, the object is the message itself.
+                if event_type == "message_new":
                     message = obj.get("message") or {}
                 else:
                     message = obj
 
                 peer_id = message.get("peer_id")
                 from_id = message.get("from_id")
+                out = message.get("out", 0)
 
-                # Check if it's a private chat
-                is_private_chat = (
-                    peer_id is not None
-                    and from_id is not None
-                    and peer_id == from_id
-                    and 0 < peer_id < 2000000000
-                )
+                is_incoming = (out == 0)
 
-                if is_private_chat:
+                # Check if we should drop the message
+                # Apply group chat filter ONLY to incoming messages
+                should_drop = is_incoming and peer_id is not None and peer_id >= 2000000000
+
+                if not should_drop:
                     # Emit unified internal event; VkAdapter will convert to UnifiedMessage
                     bus.emit(
                         "vk.incoming",
@@ -284,10 +282,11 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
                     )
                 else:
                     logger.info(
-                        "[vk] ignoring %s from group chat or non-private chat (peer_id=%s, from_id=%s)",
+                        "[vk] ignoring %s from group chat (incoming message: peer_id=%s, from_id=%s, out=%s)",
                         event_type,
                         peer_id,
                         from_id,
+                        out,
                     )
             except Exception as e:
                 raise HTTPException(

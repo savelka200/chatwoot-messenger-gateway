@@ -315,15 +315,18 @@ def wire_events(
             if not inbox_id:
                 raise RuntimeError("VK inbox_id is not configured")
 
-            custom_attributes = {"vk_user_id": from_id, "vk_peer_id": peer_id}
+            # For mirrored messages, the target user is the peer_id, not from_id (which is the community)
+            target_user_id = peer_id if is_mirror else from_id
+
+            custom_attributes = {"vk_user_id": target_user_id, "vk_peer_id": peer_id}
             if vk_bdate:
                 custom_attributes["vk_bdate"] = vk_bdate
 
             # Let ensure_contact handle attribute-first lookup
             ensured = await cw.ensure_contact(
                 inbox_id=inbox_id,
-                search_key=from_id,
-                name=vk_name or from_id,
+                search_key=target_user_id,
+                name=vk_name or target_user_id,
                 phone=None,
                 email=None,
                 custom_attributes=custom_attributes,

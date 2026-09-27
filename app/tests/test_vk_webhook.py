@@ -96,23 +96,23 @@ async def test_vk_callback_group_message(test_app):
         assert len(test_app.bus.emitted_events) == 0
 
 @pytest.mark.asyncio
-async def test_vk_callback_group_message_peer_neq_from(test_app):
+async def test_vk_callback_outgoing_message(test_app):
     transport = ASGITransport(app=test_app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         payload = {
-            "type": "message_new",
+            "type": "message_reply",
             "group_id": 123456,
             "secret": "test_secret",
             "object": {
-                "message": {
-                    "peer_id": 124,
-                    "from_id": 123
-                }
+                "peer_id": 123,
+                "from_id": 456,
+                "out": 1
             }
         }
         response = await client.post("/vk/callback/test_callback", json=payload)
         assert response.status_code == 200
         assert response.text == "ok"
 
-        # Verify event was NOT emitted
-        assert len(test_app.bus.emitted_events) == 0
+        # Verify event WAS emitted (because it's an outgoing message)
+        assert len(test_app.bus.emitted_events) == 1
+        assert test_app.bus.emitted_events[0][0] == "vk.incoming"
