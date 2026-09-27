@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 MAX_TIMESTAMP_AGE_SECONDS = 300  # 5 минут
 
+
 def verify_chatwoot_signature(
     *,
     secret: str,
@@ -27,29 +28,29 @@ def verify_chatwoot_signature(
 ) -> bool:
     """
     Проверяет HMAC-SHA256 подпись webhook от Chatwoot.
-    
+
     Формула: sha256=HMAC-SHA256(secret, "{timestamp}.{raw_body}")
-    
+
     Args:
         secret: секрет webhook из Chatwoot
         raw_body: сырое тело запроса (bytes, не парсится!)
         signature_header: значение заголовка X-Chatwoot-Signature
         timestamp_header: значение заголовка X-Chatwoot-Timestamp
-    
+
     Returns:
         True если подпись валидна, False иначе
     """
     if not signature_header or not timestamp_header:
         logger.warning("[chatwoot] Missing signature headers")
         return False
-    
+
     # Проверка timestamp (защита от replay-атак)
     try:
         timestamp = int(timestamp_header)
     except (ValueError, TypeError):
         logger.warning("[chatwoot] Invalid timestamp: %s", timestamp_header)
         return False
-    
+
     now = int(time.time())
     age = abs(now - timestamp)
     if age > MAX_TIMESTAMP_AGE_SECONDS:
@@ -60,14 +61,14 @@ def verify_chatwoot_signature(
             MAX_TIMESTAMP_AGE_SECONDS,
         )
         return False
-    
+
     # Проверяем префикс sha256=
     if not signature_header.startswith("sha256="):
         logger.warning("[chatwoot] Invalid signature prefix: %s", signature_header[:20])
         return False
-    
-    received_signature = signature_header[len("sha256="):]
-    
+
+    received_signature = signature_header[len("sha256=") :]
+
     # Вычисляем ожидаемую подпись
     # Важно: используем raw_body как bytes, не парсим JSON!
     signed_payload = f"{timestamp}.".encode("utf-8") + raw_body
@@ -76,18 +77,19 @@ def verify_chatwoot_signature(
         signed_payload,
         hashlib.sha256,
     ).hexdigest()
-    
+
     # Constant-time comparison (защита от timing attacks)
     is_valid = hmac.compare_digest(expected_signature, received_signature)
-    
+
     if not is_valid:
         logger.warning(
             "[chatwoot] Signature mismatch: expected=%s, received=%s",
             expected_signature[:16] + "...",
             received_signature[:16] + "...",
         )
-    
+
     return is_valid
+
 
 def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
     """
@@ -144,16 +146,22 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
     async def chatwoot_webhook(
         webhook_id: str,
         request: Request,
-        x_chatwoot_signature: str | None = Header(default=None, alias="X-Chatwoot-Signature"),
-        x_chatwoot_timestamp: str | None = Header(default=None, alias="X-Chatwoot-Timestamp"),
+        x_chatwoot_signature: str | None = Header(
+            default=None, alias="X-Chatwoot-Signature"
+        ),
+        x_chatwoot_timestamp: str | None = Header(
+            default=None, alias="X-Chatwoot-Timestamp"
+        ),
     ):
         channel = config.chatwoot.channel_by_webhook_id.get(webhook_id)
         if not channel:
-            raise HTTPException(status_code=403, detail=f"Unknown webhook ID: {webhook_id}")
-        
+            raise HTTPException(
+                status_code=403, detail=f"Unknown webhook ID: {webhook_id}"
+            )
+
         # === ВАЖНО: читаем сырое тело ДО парсинга JSON ===
         raw_body = await request.body()
-        
+
         # === Проверка подписи ===
         secret = config.chatwoot.secrets_by_webhook_id.get(webhook_id)
         if secret:
@@ -170,26 +178,28 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
                 "[chatwoot] No secret configured for webhook_id=%s, skipping signature check",
                 webhook_id,
             )
-        
+
         # Парсим JSON из raw body
         try:
             payload = json.loads(raw_body)
         except json.JSONDecodeError as e:
             raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
-        
+
         event = payload.get("event")
         msg_type = payload.get("message_type")
-        
+
         # Инжектим channel в метаданные
         conv = payload.setdefault("conversation", {})
         meta = conv.setdefault("meta", {})
         meta["channel"] = channel
-        
+
         logger.info(
             "[http] Chatwoot webhook accepted: event=%s type=%s channel=%s",
-            event, msg_type, channel,
+            event,
+            msg_type,
+            channel,
         )
-        
+
         if event == "message_created":
             # Обрабатываем только outgoing
             if msg_type == "outgoing":
@@ -198,7 +208,7 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
                 logger.debug("[chatwoot] Ignored incoming webhook (created via API)")
         else:
             logger.info("[chatwoot] Ignored event: %s", event)
-        
+
         return {"status": "received"}
 
     @router.post("/vk/callback/{callback_id}", response_class=PlainTextResponse)
@@ -248,11 +258,29 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
             try:
                 obj = payload.get("object") or {}
                 message = obj.get("message") or {}
-                # Emit unified internal event; VkAdapter will convert to UnifiedMessage
-                bus.emit(
-                    "vk.incoming",
-                    {"event": "message_new", "message": message, "raw": payload},
+                peer_id = message.get("peer_id")
+                from_id = message.get("from_id")
+
+                # Check if it's a private chat
+                is_private_chat = (
+                    peer_id is not None
+                    and from_id is not None
+                    and peer_id == from_id
+                    and 0 < peer_id < 2000000000
                 )
+
+                if is_private_chat:
+                    # Emit unified internal event; VkAdapter will convert to UnifiedMessage
+                    bus.emit(
+                        "vk.incoming",
+                        {"event": "message_new", "message": message, "raw": payload},
+                    )
+                else:
+                    logger.info(
+                        "[vk] ignoring message_new from group chat or non-private chat (peer_id=%s, from_id=%s)",
+                        peer_id,
+                        from_id,
+                    )
             except Exception as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid message_new payload: {e}"
@@ -297,7 +325,9 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
     async def max_webhook(
         webhook_id: str,
         request: Request,
-        x_max_bot_api_secret: str | None = Header(default=None, alias="X-Max-Bot-Api-Secret"),
+        x_max_bot_api_secret: str | None = Header(
+            default=None, alias="X-Max-Bot-Api-Secret"
+        ),
     ):
         """Webhook для MAX сообщений с проверкой секрета."""
         if not getattr(config, "max", None):
@@ -341,12 +371,17 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
 
         logger.info(
             "[max] webhook received: update_type=%s sender=%s chat=%s",
-            update_type, sender_id, chat_id,
+            update_type,
+            sender_id,
+            chat_id,
         )
 
         # Для отладки можно включить DEBUG уровень
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[max] full payload: %s", json.dumps(payload, ensure_ascii=False, indent=2))
+            logger.debug(
+                "[max] full payload: %s",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
 
         if update_type == "message_created":
             bus.emit("max.incoming", payload)
@@ -356,5 +391,3 @@ def create_router(bus: AsyncIOEventEmitter, config: AppConfig) -> APIRouter:
         return {"status": "ok"}
 
     return router
-
-
