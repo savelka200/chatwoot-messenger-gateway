@@ -6,7 +6,7 @@ import mimetypes
 from app.domain.message import TextContent
 from app.domain.ports import MessengerAdapter
 from app.domain.webhooks.chatwoot import ChatwootMessageCreatedWebhook
-from app.domain.message import MediaContent, TextContent
+from app.domain.message import MediaContent
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +208,6 @@ class MessageRouter:
             )
         return result
 
-
     async def handle_outgoing(self, payload: dict) -> None:
         try:
             cw = ChatwootMessageCreatedWebhook.model_validate(payload)
@@ -231,7 +230,11 @@ class MessageRouter:
         attachments = self._parse_chatwoot_attachments(raw_attachments)
 
         if not channel or not recipient_id:
-            logger.warning("[router] Missing fields: channel=%r recipient_id=%r", channel, recipient_id)
+            logger.warning(
+                "[router] Missing fields: channel=%r recipient_id=%r",
+                channel,
+                recipient_id,
+            )
             return
         if not text and not attachments:
             return
@@ -244,7 +247,11 @@ class MessageRouter:
 
         logger.info(
             "[router] OUTGOING: channel=%s recipient=%s text=%r attachments=%d reply=%s",
-            channel, recipient_id, text[:50] if text else "", len(attachments), reply_to_message_id,
+            channel,
+            recipient_id,
+            text[:50] if text else "",
+            len(attachments),
+            reply_to_message_id,
         )
 
         await self.dispatch_outbound(
@@ -255,30 +262,30 @@ class MessageRouter:
             reply_to_message_id=reply_to_message_id,
             conversation_id=conversation_id,
         )
-    
+
     async def dispatch_outbound(
-    self,
-    channel: str,
-    recipient_id: str,
-    text: str,
-    attachments: List[MediaContent],
-    reply_to_message_id: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-) -> None:
+        self,
+        channel: str,
+        recipient_id: str,
+        text: str,
+        attachments: List[MediaContent],
+        reply_to_message_id: Optional[str] = None,
+        conversation_id: Optional[int] = None,
+    ) -> None:
         adapter = self.adapters.get(channel)
         if not adapter:
             logger.warning("[router] No adapter for channel=%s", channel)
             return
-        
+
         # === Для MAX: получаем recipient_type из custom_attributes через httpx ===
         recipient_type = "chat_id"
         if channel == "max" and conversation_id:
             try:
                 import httpx
                 from app.config import load_config
-                
+
                 config = load_config()
-                
+
                 async with httpx.AsyncClient(
                     base_url=str(config.chatwoot.base_url),
                     timeout=10.0,
@@ -288,45 +295,50 @@ class MessageRouter:
                     },
                 ) as client:
                     account_id = config.chatwoot.account_id
-                    
+
                     # Получаем conversation
                     conv_resp = await client.get(
                         f"/api/v1/accounts/{account_id}/conversations/{conversation_id}"
                     )
-                    
+
                     if conv_resp.status_code == 200:
                         conv_data = conv_resp.json()
-                        
+
                         # Извлекаем contact_id из meta.sender
                         sender_info = conv_data.get("meta", {}).get("sender", {})
                         contact_id = sender_info.get("id")
-                        
+
                         if not contact_id:
                             # Fallback: пробуем другие варианты
                             contact_id = conv_data.get("contact_id")
-                        
+
                         if contact_id:
                             # Получаем custom_attributes контакта
                             contact_resp = await client.get(
                                 f"/api/v1/accounts/{account_id}/contacts/{contact_id}"
                             )
-                            
+
                             if contact_resp.status_code == 200:
                                 contact_data = contact_resp.json()
                                 attrs = contact_data.get("custom_attributes", {})
-                                recipient_type = attrs.get("max_recipient_type", "chat_id")
-                                recipient_id = attrs.get("max_recipient_id", recipient_id)
-                                
+                                recipient_type = attrs.get(
+                                    "max_recipient_type", "chat_id"
+                                )
+                                recipient_id = attrs.get(
+                                    "max_recipient_id", recipient_id
+                                )
+
                                 logger.info(
                                     "[router] MAX resolved: recipient_id=%s, recipient_type=%s",
-                                    recipient_id, recipient_type,
+                                    recipient_id,
+                                    recipient_type,
                                 )
-            
+
             except Exception as e:
                 logger.warning("[router] failed to resolve MAX recipient_type: %s", e)
-        
+
         failed_attachments: List[str] = []
-        
+
         if hasattr(adapter, "send_message"):
             if channel == "max":
                 failed_attachments = await adapter.send_message(
@@ -345,8 +357,10 @@ class MessageRouter:
                 )
         else:
             if text:
-                await adapter.send_text(recipient_id, TextContent(type="text", text=text))
-        
+                await adapter.send_text(
+                    recipient_id, TextContent(type="text", text=text)
+                )
+
         if failed_attachments and conversation_id:
             await self._notify_operator_about_failed_attachments(
                 conversation_id=conversation_id,
@@ -368,7 +382,7 @@ class MessageRouter:
             from app.application.chatwoot_service import ChatwootService
             from app.infra.chatwoot_client import ChatwootClient
             from app.config import load_config
-    
+
             config = load_config()
             cw_client = ChatwootClient(
                 api_access_token=config.chatwoot.api_access_token,
@@ -376,7 +390,7 @@ class MessageRouter:
                 base_url=str(config.chatwoot.base_url),
             )
             cw = ChatwootService(client=cw_client)
-    
+
             # Название канала для человека
             channel_name = {
                 "vk": "ВК",
@@ -385,10 +399,12 @@ class MessageRouter:
                 "whatsapp": "WhatsApp",
                 "max": "MAX",
             }.get(channel, channel or "мессенджер")
-    
-            error_text = f"⚠️ Не удалось отправить некоторые вложения в {channel_name}:\n"
+
+            error_text = (
+                f"⚠️ Не удалось отправить некоторые вложения в {channel_name}:\n"
+            )
             error_text += "\n".join(failed_attachments)
-    
+
             await cw.create_message(
                 conversation_id=conversation_id,
                 content=error_text,
@@ -397,7 +413,11 @@ class MessageRouter:
             )
             logger.warning(
                 "[router] Notified operator about failed attachments: conversation_id=%s count=%d channel=%s",
-                conversation_id, len(failed_attachments), channel,
+                conversation_id,
+                len(failed_attachments),
+                channel,
             )
         except Exception as e:
-            logger.error("[router] Failed to notify operator about failed attachments: %s", e)
+            logger.error(
+                "[router] Failed to notify operator about failed attachments: %s", e
+            )

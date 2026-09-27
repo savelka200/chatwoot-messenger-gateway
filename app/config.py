@@ -17,6 +17,7 @@ class WasenderWebhookConfig(BaseModel):
     api_key: str
     inbox_id: int  # per-channel inbox
 
+
 class MaxConfig(BaseModel):
     access_token: str
     bot_id: str  # ID бота (получается из GET /me)
@@ -46,12 +47,14 @@ class ChatwootWebhookConfig(BaseModel):
     # webhook_id -> secret
     secrets_by_webhook_id: Dict[str, str] = Field(default_factory=dict)
 
+
 class OKConfig(BaseModel):
     access_token: str
     group_id: Optional[str] = None
     inbox_id: int
     webhook_id: str
     auto_subscribe: bool = True
+
 
 class AppConfig(BaseModel):
     telegram: Optional[TelegramConfig] = None
@@ -61,8 +64,6 @@ class AppConfig(BaseModel):
     ok: Optional[OKConfig] = None
     max: Optional[MaxConfig] = None
     gateway_base_url: Optional[str] = None
-
- 
 
 
 def _getenv(name: str) -> str:
@@ -93,10 +94,11 @@ def _build_channel_map() -> Dict[str, str]:
         mapping[m] = "max"
     return mapping
 
+
 def _build_secret_map() -> Dict[str, str]:
     """Build a map from webhook ID to secret."""
     mapping: Dict[str, str] = {}
-    
+
     secrets = {
         "whatsapp": os.getenv("CHATWOOT_WEBHOOK_SECRET_WHATSAPP"),
         "telegram": os.getenv("CHATWOOT_WEBHOOK_SECRET_TELEGRAM"),
@@ -104,7 +106,7 @@ def _build_secret_map() -> Dict[str, str]:
         "ok": os.getenv("CHATWOOT_WEBHOOK_SECRET_OK"),
         "max": os.getenv("CHATWOOT_WEBHOOK_SECRET_MAX"),
     }
-    
+
     webhook_ids = {
         "whatsapp": os.getenv("CHATWOOT_WEBHOOK_ID_WHATSAPP"),
         "telegram": os.getenv("CHATWOOT_WEBHOOK_ID_TELEGRAM"),
@@ -112,13 +114,14 @@ def _build_secret_map() -> Dict[str, str]:
         "ok": os.getenv("CHATWOOT_WEBHOOK_ID_OK"),
         "max": os.getenv("CHATWOOT_WEBHOOK_ID_MAX"),
     }
-    
+
     for channel, webhook_id in webhook_ids.items():
         secret = secrets.get(channel)
         if webhook_id and secret:
             mapping[webhook_id] = secret
-    
+
     return mapping
+
 
 def load_config() -> AppConfig:
     try:
@@ -187,11 +190,14 @@ def load_config() -> AppConfig:
         if os.getenv("MAX_ACCESS_TOKEN") and os.getenv("MAX_INBOX_ID"):
             max_cfg = MaxConfig(
                 access_token=_getenv("MAX_ACCESS_TOKEN"),
-                bot_id=os.getenv("MAX_BOT_ID", ""),  # может быть пустым, получим через /me
+                bot_id=os.getenv(
+                    "MAX_BOT_ID", ""
+                ),  # может быть пустым, получим через /me
                 webhook_secret=_getenv("MAX_WEBHOOK_SECRET"),
                 inbox_id=int(_getenv("MAX_INBOX_ID")),
                 webhook_id=os.getenv("MAX_WEBHOOK_ID") or "max",
-                auto_subscribe=os.getenv("MAX_AUTO_SUBSCRIBE", "true").lower() == "true",
+                auto_subscribe=os.getenv("MAX_AUTO_SUBSCRIBE", "true").lower()
+                == "true",
             )
 
         return AppConfig(
@@ -210,7 +216,5 @@ def load_config() -> AppConfig:
             ),
         )
 
-
-    
     except ValidationError as e:
         raise RuntimeError(f"Invalid configuration: {e}") from e

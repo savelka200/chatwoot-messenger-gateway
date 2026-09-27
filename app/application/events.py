@@ -294,7 +294,6 @@ def wire_events(
                 last = (profile.get("last_name") or "").strip()
                 screen_name = (profile.get("screen_name") or "").strip()
                 vk_bdate = (profile.get("bdate") or "").strip() or None
-                photo = profile.get("photo_200") or ""
 
                 # Extract city from profile; VK may return dict with "title" or a plain string
                 city_info = profile.get("city")
@@ -850,7 +849,6 @@ def wire_events(
                 raise RuntimeError("MAX inbox_id not configured")
 
             # Формируем identifier для поиска (max:{user_id})
-            max_identifier = f"max:{sender_user_id}"
 
             custom_attributes = {
                 "max_user_id": str(sender_user_id),

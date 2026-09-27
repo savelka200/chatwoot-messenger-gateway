@@ -26,25 +26,30 @@ class ChatwootService:
         additional_attributes: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         contacts = []
-    
+
         # === Идентификаторы для разных каналов ===
         vk_user_id = (custom_attributes or {}).get("vk_user_id")
         ok_user_id = (custom_attributes or {}).get("ok_user_id")
         tg_user_id = (custom_attributes or {}).get("telegram_user_id")
         max_user_id = (custom_attributes or {}).get("max_user_id")  # ← НОВОЕ
-    
+
         vk_identifier = f"vk:{vk_user_id}" if vk_user_id else None
         ok_identifier = f"ok:{ok_user_id}" if ok_user_id else None
         tg_identifier = f"tg:{tg_user_id}" if tg_user_id else None
         max_identifier = f"max:{max_user_id}" if max_user_id else None  # ← НОВОЕ
-        
+
         # Выбираем identifier для текущего канала
         identifier = max_identifier or ok_identifier or vk_identifier or tg_identifier
-    
+
         # 1) Attribute-based lookup через filter_contacts
         attr_lookup_keys = [
             k
-            for k in ("vk_user_id", "telegram_user_id", "ok_user_id", "max_user_id")  # ← ДОБАВЛЕНО
+            for k in (
+                "vk_user_id",
+                "telegram_user_id",
+                "ok_user_id",
+                "max_user_id",
+            )  # ← ДОБАВЛЕНО
             if k in (custom_attributes or {})
         ]
         if attr_lookup_keys:
@@ -55,17 +60,19 @@ class ChatwootService:
                 contacts = (res or {}).get("payload") or []
             except Exception as e:
                 logger.warning("[chatwoot] filter_contacts failed: %s", e)
-    
+
         # 2) Поиск по identifier (надёжный способ)
         if not contacts and identifier:
             try:
                 res = await self._client.search_contacts(q=identifier)
                 contacts = (res or {}).get("payload") or []
                 if contacts:
-                    logger.info("[chatwoot] found contact by identifier: %s", identifier)
+                    logger.info(
+                        "[chatwoot] found contact by identifier: %s", identifier
+                    )
             except Exception as e:
                 logger.warning("[chatwoot] search by identifier failed: %s", e)
-    
+
         # 3) Fallback: поиск по search_key
         if not contacts:
             try:
@@ -73,7 +80,7 @@ class ChatwootService:
                 contacts = (res or {}).get("payload") or []
             except Exception as e:
                 logger.warning("[chatwoot] search_contacts failed: %s", e)
-    
+
         # 4) Update or create
         if contacts:
             contact = contacts[0]
@@ -81,15 +88,15 @@ class ChatwootService:
             if custom_attributes or additional_attributes is not None:
                 try:
                     await self._client.update_contact(
-                    contact_id=contact_id,
-                    name=None,
-                    phone_number=None,
-                    email=None,
-                    identifier=identifier,
-                    custom_attributes=custom_attributes,
-                    additional_attributes=additional_attributes,
-                    avatar_url=avatar_url,
-                )
+                        contact_id=contact_id,
+                        name=None,
+                        phone_number=None,
+                        email=None,
+                        identifier=identifier,
+                        custom_attributes=custom_attributes,
+                        additional_attributes=additional_attributes,
+                        avatar_url=avatar_url,
+                    )
                 except Exception as e:
                     logger.warning("[chatwoot] update_contact skipped: %s", e)
             if name and not (contact.get("name") or "").strip():
@@ -115,11 +122,14 @@ class ChatwootService:
             contact = payload.get("contact") or created.get("contact") or {}
             if not contact and "id" in (created or {}):
                 contact = created
-    
+
         source_id = self._extract_source_id_for_inbox(contact, inbox_id) or search_key
         logger.info(
             "[chatwoot] ensure_contact ok id=%s inbox=%s source_id=%r identifier=%r",
-            contact.get("id"), inbox_id, source_id, identifier,
+            contact.get("id"),
+            inbox_id,
+            source_id,
+            identifier,
         )
         return {"id": int(contact.get("id")), "source_id": source_id}
 
@@ -175,8 +185,6 @@ class ChatwootService:
         logger.info("[chatwoot] create conversation id=%s inbox=%s", conv_id, inbox_id)
         return int(conv_id)
 
-
-
     async def create_message(
         self,
         *,
@@ -184,7 +192,7 @@ class ChatwootService:
         content: str,
         direction: Literal["incoming", "outgoing"],
         attachments: Optional[List[Tuple[str, bytes, str]]] = None,
-        private = False 
+        private=False,
     ) -> int:
         message_type = "incoming" if direction == "incoming" else "outgoing"
         res = await self._client.send_message(
@@ -192,7 +200,7 @@ class ChatwootService:
             content=content or "",
             message_type=message_type,
             attachments=attachments,
-            private = private,
+            private=private,
         )
         msg_id = (res or {}).get("id") or ((res or {}).get("payload") or {}).get("id")
         logger.info("[chatwoot] create_message id=%s type=%s", msg_id, message_type)

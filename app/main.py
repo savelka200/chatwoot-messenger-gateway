@@ -72,7 +72,9 @@ async def lifespan(app: FastAPI):
                 logging.warning("[main] OK webhook subscription failed, check manually")
 
     if config.max and config.max.auto_subscribe:
-        webhook_url = f"{config.gateway_base_url.rstrip('/')}/max/webhook/{config.max.webhook_id}"
+        webhook_url = (
+            f"{config.gateway_base_url.rstrip('/')}/max/webhook/{config.max.webhook_id}"
+        )
         logging.info("[main] subscribing MAX webhook to: %s", webhook_url)
         await max_adapter.start()
         success = await max_adapter.subscribe_webhook(webhook_url)
@@ -90,6 +92,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(
             *(a.stop() for a in adapters.values()), return_exceptions=True
         )
+
 
 app = FastAPI(title="Messaging Bridge", version="0.1.0", lifespan=lifespan)
 app.include_router(create_router(bus=bus, config=config))
